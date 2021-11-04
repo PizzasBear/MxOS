@@ -1,0 +1,16 @@
+[package]
+name = "mxos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+x86_64 = "0.14"
+multiboot2 = "0.12"
+libm = "0.2"
+spin = "0.9"
+log = "0.4"
+uart_16550 = "0.2"
