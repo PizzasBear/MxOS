@@ -1,3 +1,7 @@
+//! This module contains everything related to the IDT.
+//!
+//! To initialize the IDT call `crate::idt::init_idt()`.
+
 use crate::serial::Indent;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -41,6 +45,7 @@ extern "x86-interrupt" fn page_fault_handler(
     loop {}
 }
 
+/// Initializes the IDT
 pub fn init_idt() {
     IDT.load();
 }

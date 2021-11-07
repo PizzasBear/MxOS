@@ -1,7 +1,33 @@
+//! This module contains a lot of the structures and algorithms related to memory allocation.
+//!
+
+use core::marker::PhantomData;
+use core::mem::size_of;
 use core::ops::Range;
 use multiboot2::{BootInformation, MemoryArea, MemoryMapTag};
-use x86_64::structures::paging::{FrameAllocator, PageTable, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, PageSize, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+};
 use x86_64::{PhysAddr, VirtAddr};
+
+/// The page allocator trait.
+pub trait PageAllocator<S: PageSize> {
+    /// Allocates a page and returns it's virtual address.
+    fn allocate_page(&mut self) -> VirtAddr;
+    /// Allocates multiple pages continuously.
+    fn allocate_pages(&mut self, num: u64) -> Option<VirtAddr>;
+}
+
+/// The page deallocator.
+pub trait PageDeallocator<S: PageSize> {
+    /// The error type.
+    type Err;
+
+    /// Deallocates a page and returns it's virtual address.
+    fn deallocate_page(&mut self) -> Result<(), Self::Err>;
+    /// Deallocates multiple pages continuously.
+    fn deallocate_pages(&mut self, num: u64) -> Result<(), Self::Err>;
+}
 
 /// A very simple frame allocator, it can't deallocate any frames.
 /// It will be used for setup of the main frame allocator.
@@ -15,7 +41,8 @@ pub struct BasicFrameAllocator<'a> {
 }
 
 impl<'a> BasicFrameAllocator<'a> {
-    /// Create a new BasicFrameAllocator. Taken areas .
+    /// Create a new BasicFrameAllocator. Taken areas are addresses that are taken by either the
+    /// kernel or the Multiboot2 information structure.
     pub fn new(taken_areas: [Range<u64>; 2], memory_map_tag: &'a MemoryMapTag) -> Self {
         Self {
             current_frame: 4096,
@@ -27,7 +54,7 @@ impl<'a> BasicFrameAllocator<'a> {
     }
 }
 
-impl<'a> BasicFrameAllocator<'a> {
+impl<'a> PageAllocator<Size4KiB> for BasicFrameAllocator<'a> {
     fn allocate_page(&mut self) -> VirtAddr {
         unsafe {
             use x86_64::registers::control::Cr3;
@@ -101,6 +128,15 @@ impl<'a> BasicFrameAllocator<'a> {
             alloc_page_addr
         }
     }
+
+    fn allocate_pages(&mut self, num: u64) -> Option<VirtAddr> {
+        let first = self.allocate_page();
+        for i in 1..num {
+            let page = self.allocate_page();
+            assert_eq!(first.as_u64() + 4096 * i, page.as_u64());
+        }
+        Some(first)
+    }
 }
 
 unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
@@ -131,40 +167,104 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
     }
 }
 
-struct FixedSizeAllocator {
-    size: u64,
+/// A slab allocator, that allocates only type T. It needs a page allocator, but it never
+/// deallocates.
+pub struct SlabAllocator<T> {
+    free_size: u64,
     free_list: *mut FreeList,
+    _phantom: PhantomData<T>,
 }
 
-impl FixedSizeAllocator {
-    fn new(size: u64, init_num_pages: u64, bfa: &mut BasicFrameAllocator) -> Self {
-        assert!(
-            core::mem::size_of::<FreeList>() < size as usize && size < 4096 && size & size - 1 == 0
-        );
+impl<T: Sized> SlabAllocator<T> {
+    /// Creates a new slab allocator from a page allocator.
+    pub fn new<A: PageAllocator<Size4KiB>>(allocator: &mut A) -> Self {
         unsafe {
-            let page = bfa.allocate_page();
-            let free_list = page.as_u64() as *mut FreeList;
-            *free_list = FreeList {
-                size: 4096,
-                next: Some({
-                    let page = bfa.allocate_page();
-                    let free_list = page.as_u64() as *mut FreeList;
-                    *free_list = FreeList {
+            const INIT_FREE_SIZE: u64 = 16 * 4096;
+
+            assert_eq!(size_of::<FreeList>(), 16);
+            assert!(16 < size_of::<T>() && size_of::<T>() < 4096);
+            assert_eq!(size_of::<T>() & 0xf, 0);
+
+            Self {
+                free_size: INIT_FREE_SIZE,
+                free_list: {
+                    let pages = allocator
+                        .allocate_pages(INIT_FREE_SIZE / 4096)
+                        .unwrap()
+                        .as_mut_ptr();
+                    *pages = FreeList {
+                        size: INIT_FREE_SIZE,
+                        next: None,
                     };
-                    free_list
-                })
+                    pages
+                },
+                _phantom: PhantomData,
             }
-            Self { size, free_list }
         }
+    }
+
+    /// Allocates a pointer to `T`.
+    pub unsafe fn malloc<A: PageAllocator<Size4KiB>>(&mut self, allocator: &mut A) -> *mut T {
+        const MIN_FREE_SIZE: u64 = 8 * 4096;
+
+        if self.free_size < MIN_FREE_SIZE {
+            self.free_size += MIN_FREE_SIZE;
+            let pages = allocator
+                .allocate_pages(MIN_FREE_SIZE / 4096)
+                .unwrap()
+                .as_mut_ptr();
+            *pages = FreeList {
+                size: MIN_FREE_SIZE,
+                next: Some(self.free_list),
+            };
+            self.free_list = pages;
+        }
+
+        let FreeList { size, next } = *self.free_list;
+        if (size_of::<T>() as u64) < size {
+            let ptr = self.free_list as *mut T;
+            self.free_list = self.free_list.add(size_of::<T>() / 16);
+            *self.free_list = FreeList {
+                size: size - size_of::<T>() as u64,
+                next,
+            };
+            self.free_size -= size_of::<T>() as u64;
+
+            ptr
+        } else if size_of::<T>() == size as usize {
+            let ptr = self.free_list as *mut T;
+            self.free_list = next.unwrap();
+            self.free_size -= size_of::<T>() as u64;
+
+            ptr
+        } else {
+            self.free_list = next.unwrap();
+            self.free_size -= size;
+
+            self.malloc(allocator)
+        }
+    }
+
+    /// Deallocates a pointer to `T`;
+    pub unsafe fn free(&mut self, ptr: *mut T) {
+        let free_list = self.free_list;
+        self.free_list = ptr as *mut FreeList;
+        *self.free_list = FreeList {
+            size: size_of::<T>() as _,
+            next: Some(free_list),
+        };
+        self.free_size += size_of::<T>() as u64;
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(16))]
 struct FreeList {
     size: u64,
     next: Option<*mut FreeList>,
 }
 
+/// This function creates a new page table that contains the kernel and the multiboot information.
 pub unsafe fn reset_page_table<FA: FrameAllocator<Size4KiB>>(
     kernel_start: u64,
     kernel_end: u64,

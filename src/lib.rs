@@ -13,9 +13,9 @@
 
 // extern crate alloc;
 
-mod idt;
-mod mem;
-mod serial;
+pub mod idt;
+pub mod mem;
+pub mod serial;
 
 use core::panic::PanicInfo;
 use mem::BasicFrameAllocator;
