@@ -1,0 +1,94 @@
+from sortedcontainers import SortedList
+
+ORDER: int = 8
+MEMORY_SIZE: int = 10 << ORDER - 1
+
+memory = [0] * MEMORY_SIZE
+
+buddies = [[False] * (MEMORY_SIZE >> i) for i in range(ORDER - 1)]
+buddies.append([True] * (MEMORY_SIZE >> ORDER - 1))
+
+free_areas = [SortedList() for _ in range(ORDER - 1)]
+free_areas.append(SortedList(range(0, MEMORY_SIZE, 1 << ORDER - 1)))
+
+def print_buddies():
+    global buddies, free_areas
+
+    for i, b in enumerate(buddies):
+        print(end=' ' * ((1 << i) - 1))
+        print(*map(lambda x: '.' if x else '#', b), sep=' ' * ((1 << i + 1) - 1))
+    print(*free_areas, sep='\n')
+
+def order_malloc(order: int) -> int:
+    global buddies, free_areas
+
+    if len(free_areas[order]):
+        addr: int = free_areas[order].pop(0)
+        buddies[order][addr >> order] ^= True
+        return addr
+    elif order + 1 < len(buddies):
+        addr = order_malloc(order + 1)
+        buddies[order][addr >> order | 1] ^= True
+        free_areas[order].add(addr | 1 << order)
+        return addr
+    else:
+        raise RuntimeError
+
+def malloc(size: int) -> int:
+    global buddies, free_areas
+
+    order = 0
+    while 1 << order < size:
+        order += 1
+    free_addr = addr = order_malloc(order)
+    for i in reversed(range(order)):
+        free_addr += 1 << i
+        if -size & 1 << i:
+            buddies[i][free_addr >> i] ^= True
+            free_areas[i].add(free_addr)
+            free_addr -= 1 << i
+    return addr
+
+def order_free(addr: int, order: int, clear: bool = True):
+    global buddies, free_areas
+
+    if clear:
+        memory[addr:addr+(1<<order)] = [0] * (1<<order)
+    oaddr = addr >> order
+    buddy = oaddr ^ 1
+    if order + 1 < len(buddies) and buddies[order][buddy]:
+        free_areas[order].remove(addr ^ 1 << order)
+        buddies[order][buddy] ^= True
+        order_free(addr & ~(1 << order), order + 1, False)
+    else:
+        buddies[order][oaddr] ^= True
+        free_areas[order].add(addr)
+
+def free(addr: int, size: int, clear: bool = True):
+    global buddies, free_areas
+
+    if clear:
+        memory[addr:addr+size] = [0] * size
+    i = 0
+    free_addr = addr + size
+    while 1 << i <= size:
+        if size & 1 << i:
+            free_addr -= 1 << i
+            order_free(free_addr, i, False)
+        i += 1
+
+
+a = malloc(100)
+
+memory[a:a+100] = list(range(100))
+print(memory[a:a+100])
+print(a)
+
+b = malloc(16)
+memory[b:b+16] = list(range(16))
+print(memory[b:b+16])
+print(b)
+
+free(a, 100)
+free(b, 16)
+

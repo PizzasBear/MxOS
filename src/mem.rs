@@ -27,6 +27,82 @@ impl<'a> BasicFrameAllocator<'a> {
     }
 }
 
+impl<'a> BasicFrameAllocator<'a> {
+    fn allocate_page(&mut self) -> VirtAddr {
+        unsafe {
+            use x86_64::registers::control::Cr3;
+
+            let mut frames = [PhysFrame::from_start_address(PhysAddr::new(0)).unwrap(); 16];
+            frames[0] = self.allocate_frame().unwrap();
+            let alloc_page_addr = VirtAddr::new(frames[0].start_address().as_u64());
+
+            let mut frames_start = 0;
+            let mut frames_len = 1;
+            // let virt_addr = VirtAddr::new(frames[0].start_address().as_u64());
+
+            let (level_4_page_frame, _) = Cr3::read();
+            let level_4_page =
+                &mut *(level_4_page_frame.start_address().as_u64() as *mut PageTable);
+
+            // Allocate frames for the pages
+            while 0 < frames_len {
+                let addr = frames[frames_start].start_address().as_u64();
+                let virt_addr = VirtAddr::new(addr);
+
+                frames_start = (frames_start + 1) % frames.len();
+                frames_len -= 1;
+
+                let p4_entry = &mut level_4_page[virt_addr.p4_index()];
+                if p4_entry.is_unused() {
+                    let frame = self.allocate_frame().unwrap();
+                    frames[(frames_start + frames_len) % frames.len()] = frame;
+                    frames_len += 1;
+                    assert!(frames_len <= frames.len(), "Too many frames");
+
+                    p4_entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+                    let p3 = &mut *(p4_entry.addr().as_u64() as *mut PageTable);
+                    p3.zero();
+                }
+                let p3 = &mut *(p4_entry.addr().as_u64() as *mut PageTable);
+
+                let p3_entry = &mut p3[virt_addr.p3_index()];
+                if p3_entry.is_unused() {
+                    let frame = self.allocate_frame().unwrap();
+                    frames[(frames_start + frames_len) % frames.len()] = frame;
+                    frames_len += 1;
+                    assert!(frames_len <= frames.len(), "Too many frames");
+
+                    p3_entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+                    let p2 = &mut *(p3_entry.addr().as_u64() as *mut PageTable);
+                    p2.zero();
+                }
+                let p2 = &mut *(p3_entry.addr().as_u64() as *mut PageTable);
+
+                let p2_entry = &mut p2[virt_addr.p2_index()];
+                if p2_entry.is_unused() {
+                    let frame = self.allocate_frame().unwrap();
+                    frames[(frames_start + frames_len) % frames.len()] = frame;
+                    frames_len += 1;
+                    assert!(frames_len <= frames.len(), "Too many frames");
+
+                    p2_entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+                    let p1 = &mut *(p2_entry.addr().as_u64() as *mut PageTable);
+                    p1.zero();
+                }
+                let p1 = &mut *(p2_entry.addr().as_u64() as *mut PageTable);
+
+                let p1_entry = &mut p1[virt_addr.p1_index()];
+                assert!(p1_entry.is_unused());
+                p1_entry.set_frame(
+                    PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap(),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                );
+            }
+            alloc_page_addr
+        }
+    }
+}
+
 unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         let current_area = self.current_area?;
@@ -53,6 +129,40 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
 
         Some(PhysFrame::from_start_address(PhysAddr::new(self.current_frame - 4096)).unwrap())
     }
+}
+
+struct FixedSizeAllocator {
+    size: u64,
+    free_list: *mut FreeList,
+}
+
+impl FixedSizeAllocator {
+    fn new(size: u64, init_num_pages: u64, bfa: &mut BasicFrameAllocator) -> Self {
+        assert!(
+            core::mem::size_of::<FreeList>() < size as usize && size < 4096 && size & size - 1 == 0
+        );
+        unsafe {
+            let page = bfa.allocate_page();
+            let free_list = page.as_u64() as *mut FreeList;
+            *free_list = FreeList {
+                size: 4096,
+                next: Some({
+                    let page = bfa.allocate_page();
+                    let free_list = page.as_u64() as *mut FreeList;
+                    *free_list = FreeList {
+                    };
+                    free_list
+                })
+            }
+            Self { size, free_list }
+        }
+    }
+}
+
+#[repr(C, align(16))]
+struct FreeList {
+    size: u64,
+    next: Option<*mut FreeList>,
 }
 
 pub unsafe fn reset_page_table<FA: FrameAllocator<Size4KiB>>(
