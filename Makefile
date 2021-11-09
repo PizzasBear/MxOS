@@ -1,5 +1,5 @@
 arch ?= x86_64
-build_folder := build/
+build_folder := target/build/debug/
 kernel := $(build_folder)/kernel-$(arch).bin
 iso := $(build_folder)/os-$(arch).iso
 target ?= $(arch)-mxos

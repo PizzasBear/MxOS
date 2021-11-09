@@ -1,7 +1,7 @@
 from typing import Reversible, Union
 
-ORDER: int = 4
-MEMORY_SIZE: int = 5 << ORDER - 1
+ORDER: int = 9
+MEMORY_SIZE: int = 2 << ORDER - 1
 
 
 class LinkedListNode:

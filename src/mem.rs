@@ -32,7 +32,7 @@ pub trait PageDeallocator<S: PageSize> {
 /// A very simple frame allocator, it can't deallocate any frames.
 /// It will be used for setup of the main frame allocator.
 #[derive(Debug)]
-pub struct BasicFrameAllocator<'a> {
+pub struct BumpAllocator<'a> {
     current_frame: u64,
     taken_areas: [Range<u64>; 2],
     current_area: Option<&'a MemoryArea>,
@@ -40,7 +40,7 @@ pub struct BasicFrameAllocator<'a> {
     memory_map_tag: &'a MemoryMapTag,
 }
 
-impl<'a> BasicFrameAllocator<'a> {
+impl<'a> BumpAllocator<'a> {
     /// Create a new BasicFrameAllocator. Taken areas are addresses that are taken by either the
     /// kernel or the Multiboot2 information structure.
     pub fn new(taken_areas: [Range<u64>; 2], memory_map_tag: &'a MemoryMapTag) -> Self {
@@ -54,7 +54,7 @@ impl<'a> BasicFrameAllocator<'a> {
     }
 }
 
-impl<'a> PageAllocator<Size4KiB> for BasicFrameAllocator<'a> {
+impl<'a> PageAllocator<Size4KiB> for BumpAllocator<'a> {
     fn allocate_page(&mut self) -> VirtAddr {
         unsafe {
             use x86_64::registers::control::Cr3;
@@ -133,13 +133,16 @@ impl<'a> PageAllocator<Size4KiB> for BasicFrameAllocator<'a> {
         let first = self.allocate_page();
         for i in 1..num {
             let page = self.allocate_page();
-            assert_eq!(first.as_u64() + 4096 * i, page.as_u64());
+            if first.as_u64() + 4096 * i != page.as_u64() {
+                self.allocate_pages(num - 1);
+                return Some(page);
+            }
         }
         Some(first)
     }
 }
 
-unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
+unsafe impl<'a> FrameAllocator<Size4KiB> for BumpAllocator<'a> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         let current_area = self.current_area?;
 
@@ -171,7 +174,7 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for BasicFrameAllocator<'a> {
 /// deallocates.
 pub struct SlabAllocator<T> {
     free_size: u64,
-    free_list: *mut FreeList,
+    free_list: *mut SlabFreeList,
     _phantom: PhantomData<T>,
 }
 
@@ -181,8 +184,17 @@ impl<T: Sized> SlabAllocator<T> {
         unsafe {
             const INIT_FREE_SIZE: u64 = 16 * 4096;
 
-            assert_eq!(size_of::<FreeList>(), 16);
-            assert!(16 < size_of::<T>() && size_of::<T>() < 4096);
+            assert_eq!(size_of::<SlabFreeList>(), 16);
+            assert!(
+                16 <= size_of::<T>(),
+                "Slab allocator's type T size, {} bytes, is smaller than 16 bytes",
+                size_of::<T>(),
+            );
+            assert!(
+                size_of::<T>() <= 2048,
+                "Slab allocator's type T size, {} bytes, is larger than 2048 bytes",
+                size_of::<T>(),
+            );
             assert_eq!(size_of::<T>() & 0xf, 0);
 
             Self {
@@ -192,8 +204,8 @@ impl<T: Sized> SlabAllocator<T> {
                         .allocate_pages(INIT_FREE_SIZE / 4096)
                         .unwrap()
                         .as_mut_ptr();
-                    *pages = FreeList {
-                        size: INIT_FREE_SIZE,
+                    *pages = SlabFreeList {
+                        size: INIT_FREE_SIZE - INIT_FREE_SIZE % size_of::<T>() as u64,
                         next: None,
                     };
                     pages
@@ -213,18 +225,21 @@ impl<T: Sized> SlabAllocator<T> {
                 .allocate_pages(MIN_FREE_SIZE / 4096)
                 .unwrap()
                 .as_mut_ptr();
-            *pages = FreeList {
-                size: MIN_FREE_SIZE,
+            *pages = SlabFreeList {
+                size: MIN_FREE_SIZE - MIN_FREE_SIZE % size_of::<T>() as u64,
                 next: Some(self.free_list),
             };
             self.free_list = pages;
         }
+        self.zero_alloc_malloc()
+    }
 
-        let FreeList { size, next } = *self.free_list;
+    unsafe fn zero_alloc_malloc(&mut self) -> *mut T {
+        let SlabFreeList { size, next } = *self.free_list;
         if (size_of::<T>() as u64) < size {
             let ptr = self.free_list as *mut T;
             self.free_list = self.free_list.add(size_of::<T>() / 16);
-            *self.free_list = FreeList {
+            *self.free_list = SlabFreeList {
                 size: size - size_of::<T>() as u64,
                 next,
             };
@@ -238,18 +253,19 @@ impl<T: Sized> SlabAllocator<T> {
 
             ptr
         } else {
+            log::error!("Slab allocator free area is too small");
             self.free_list = next.unwrap();
             self.free_size -= size;
 
-            self.malloc(allocator)
+            self.zero_alloc_malloc()
         }
     }
 
     /// Deallocates a pointer to `T`;
     pub unsafe fn free(&mut self, ptr: *mut T) {
         let free_list = self.free_list;
-        self.free_list = ptr as *mut FreeList;
-        *self.free_list = FreeList {
+        self.free_list = ptr as *mut SlabFreeList;
+        *self.free_list = SlabFreeList {
             size: size_of::<T>() as _,
             next: Some(free_list),
         };
@@ -259,9 +275,62 @@ impl<T: Sized> SlabAllocator<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(16))]
-struct FreeList {
+struct SlabFreeList {
     size: u64,
-    next: Option<*mut FreeList>,
+    next: Option<*mut SlabFreeList>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(16))]
+struct BuddyFreeList {
+    ptr: u64,
+    next: Option<*mut BuddyFreeList>,
+}
+
+struct Buddy {
+    bitmap: &'static mut [u8],
+    free_list: SlabAllocator<BuddyFreeList>,
+}
+
+struct BuddyAllocator<const N: usize> {
+    buddies: [Buddy; N],
+}
+
+impl<const N: usize> BuddyAllocator<N> {
+    fn new(&mut self, kernel_start: u64, kernel_end: u64, boot_info: &BootInformation) {
+        let mem_end = boot_info
+            .memory_map_tag()
+            .unwrap()
+            .memory_areas()
+            .map(|area| area.end_address())
+            .max()
+            .unwrap()
+            & !(128 * 4096 - 1);
+
+        let buddies = [core::ptr::null_mut(); 8];
+        for i in 0..8 {
+            buddies[i] = bump_allocator
+                .allocate_pages(mem_end >> 12 + 3 + i)
+                .unwrap()
+                .as_mut_ptr();
+        }
+        // let buddies = [
+        //     bump_allocator
+        //         .allocate_pages(mem_end / 4096 / 8)
+        //         .unwrap()
+        //         .as_mut_ptr(),
+        //     bump_allocator
+        //         .allocate_pages(mem_end / 4096 / 8 / 2)
+        //         .unwrap()
+        //         .as_mut_ptr(),
+        // ];
+
+        let bump_allocator_end = bump_allocator
+            .allocate_frame()
+            .unwrap()
+            .start_address()
+            .as_u64();
+    }
 }
 
 /// This function creates a new page table that contains the kernel and the multiboot information.

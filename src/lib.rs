@@ -18,7 +18,7 @@ pub mod mem;
 pub mod serial;
 
 use core::panic::PanicInfo;
-use mem::BasicFrameAllocator;
+use mem::BumpAllocator;
 
 // /// Internal stuff
 // #[doc(hidden)]
@@ -98,7 +98,7 @@ pub extern "C" fn kernel_main(multiboot_info_ptr: u32) -> ! {
         .max()
         .unwrap();
 
-    let mut frame_allocator = BasicFrameAllocator::new(
+    let mut frame_allocator = BumpAllocator::new(
         [
             kernel_start..kernel_end,
             (boot_info.start_address() as _)..(boot_info.end_address() as _),
