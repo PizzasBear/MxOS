@@ -66,6 +66,7 @@ dependencies = [
 name = "mxos"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "lazy_static",
  "libm",
  "log",

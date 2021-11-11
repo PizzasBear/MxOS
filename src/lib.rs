@@ -98,17 +98,17 @@ pub extern "C" fn kernel_main(multiboot_info_ptr: u32) -> ! {
         .max()
         .unwrap();
 
-    let mut frame_allocator = BumpAllocator::new(
-        [
-            kernel_start..kernel_end,
-            (boot_info.start_address() as _)..(boot_info.end_address() as _),
-        ],
-        memory_map_tag,
-    );
+    // let mut frame_allocator = BumpAllocator::new(
+    //     [
+    //         kernel_start..kernel_end,
+    //         (boot_info.start_address() as _)..(boot_info.end_address() as _),
+    //     ],
+    //     memory_map_tag,
+    // );
 
-    unsafe {
-        mem::reset_page_table(kernel_start, kernel_end, &boot_info, &mut frame_allocator);
-    }
+    // unsafe {
+    //     mem::reset_page_table(kernel_start, kernel_end, &boot_info, &mut frame_allocator);
+    // }
 
     log::info!("Kernel main END");
     loop {}

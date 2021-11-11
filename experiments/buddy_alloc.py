@@ -96,7 +96,7 @@ def order_malloc(order: int) -> int:
         if area is None:
             if order + 1 < len(buddies):
                 addr = order_malloc(order + 1)
-                order_buddies[addr >> order] = True
+                # order_buddies[addr >> order] = True
                 order_buddies[addr >> order | 1] = False
                 order_free_areas.push(addr | 1 << order)
                 return addr
