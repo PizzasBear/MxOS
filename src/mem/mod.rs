@@ -2,209 +2,37 @@
 //!
 
 mod btree;
+mod bump;
+mod slab;
 
-use core::marker::PhantomData;
-use core::mem::{align_of, size_of, MaybeUninit};
-use core::ops::Range;
+pub use slab::SlabAllocator;
+
+use bump::BumpAllocator;
+
+use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
-use multiboot2::{BootInformation, MemoryArea, MemoryMapTag};
-use x86_64::structures::paging::{FrameAllocator, PageSize, PageTable, PhysFrame, Size2MiB};
-use x86_64::{PhysAddr, VirtAddr};
+use multiboot2::{BootInformation, MemoryMapTag};
+use x86_64::structures::paging::{FrameAllocator, PageSize, PageTable, Size2MiB};
 
-/// The page allocator trait.
-pub trait PageAllocator<S: PageSize> {
-    /// Allocates a page and returns it's virtual address.
-    fn allocate_page(&mut self) -> VirtAddr;
-    /// Allocates multiple pages continuously.
-    fn allocate_pages(&mut self, num: u64) -> Option<VirtAddr>;
-}
+// /// The page allocator trait.
+// pub trait PageAllocator<S: PageSize> {
+//     /// Allocates a page and returns it's virtual address.
+//     fn allocate_page(&mut self) -> VirtAddr;
+//     /// Allocates multiple pages continuously.
+//     fn allocate_pages(&mut self, num: u64) -> Option<VirtAddr>;
+// }
 
-/// The page deallocator.
-pub trait PageDeallocator<S: PageSize> {
-    /// The error type.
-    type Err;
-
-    /// Deallocates a page and returns it's virtual address.
-    fn deallocate_page(&mut self) -> Result<(), Self::Err>;
-    /// Deallocates multiple pages continuously.
-    fn deallocate_pages(&mut self, num: u64) -> Result<(), Self::Err>;
-}
-
-/// A very simple frame allocator, it can't deallocate any frames.
-/// It will be used for setup of the main frame allocator.
-#[derive(Debug)]
-pub struct BumpAllocator<'a> {
-    current_frame: usize,
-    taken_areas: [Range<usize>; 2],
-    current_area: Option<&'a MemoryArea>,
-    memory_area_index: usize,
-    memory_map_tag: &'a MemoryMapTag,
-}
-
-impl<'a> BumpAllocator<'a> {
-    /// Create a new BasicFrameAllocator. Taken areas are addresses that are taken by either the
-    /// kernel or the Multiboot2 information structure.
-    pub fn new(taken_areas: [Range<usize>; 2], memory_map_tag: &'a MemoryMapTag) -> Self {
-        Self {
-            current_frame: 0x200000,
-            current_area: memory_map_tag.memory_areas().next(),
-            memory_area_index: 0,
-            memory_map_tag,
-            taken_areas,
-        }
-    }
-}
-
-unsafe impl<'a> FrameAllocator<Size2MiB> for BumpAllocator<'a> {
-    fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
-        let current_area = self.current_area?;
-
-        if self.current_frame < current_area.start_address() as usize {
-            self.current_frame = current_area.start_address() as usize + 0x1fffff & !0x1fffff;
-        }
-
-        if (current_area.end_address() as usize) < self.current_frame + 0x200000 {
-            self.memory_area_index += 1;
-            self.current_area = self
-                .memory_map_tag
-                .memory_areas()
-                .nth(self.memory_area_index);
-            return self.allocate_frame();
-        }
-        for area in &self.taken_areas {
-            if area.start < self.current_frame + 0x200000 && self.current_frame < area.end {
-                self.current_frame = area.end + 0x1fffff & !0x1fffff;
-                return self.allocate_frame();
-            }
-        }
-        let frame = PhysFrame::from_start_address(PhysAddr::new(self.current_frame as _)).unwrap();
-
-        self.current_frame += 0x200000;
-
-        Some(frame)
-    }
-}
-
-/// A slab allocator, that allocates only type T. It needs a page allocator, but it never
-/// deallocates.
-#[derive(Debug)]
-pub struct SlabAllocator<T> {
-    free_size: usize,
-    free_list: ptr::NonNull<SlabFreeList>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: Sized> SlabAllocator<T> {
-    const SLAB_SIZE: usize = {
-        let size = size_of::<T>() + align_of::<T>() - 1;
-        size - size % align_of::<T>()
-    };
-
-    /// Creates a new slab allocator from a page allocator.
-    ///
-    /// # Safety
-    /// `chunk_addr` has to be a pointer to a chunk of 2 MiB.
-    pub fn new(chunk: &'static mut [u8]) -> Self {
-        unsafe {
-            assert_eq!(size_of::<SlabFreeList>(), 16);
-
-            assert!(
-                16 <= Self::SLAB_SIZE,
-                "Slab allocator's type T size, {} bytes, is smaller than 16 bytes",
-                Self::SLAB_SIZE,
-            );
-            assert_eq!(align_of::<T>() & 0xf, 0);
-
-            let free_size = chunk.len() - chunk.len() % Self::SLAB_SIZE;
-            Self {
-                free_size,
-                free_list: {
-                    let mut free_list = ptr::NonNull::new(chunk.as_mut_ptr() as _).unwrap();
-                    *free_list.as_mut() = SlabFreeList {
-                        size: free_size,
-                        next: None,
-                    };
-                    free_list
-                },
-                _phantom: PhantomData,
-            }
-        }
-    }
-
-    /// Allocates a pointer to `T`.
-    pub fn add_chunk(&mut self, chunk: &'static mut [u8]) {
-        unsafe {
-            let alloc_size = chunk.len() - chunk.len() % Self::SLAB_SIZE;
-
-            self.free_size += alloc_size;
-            let mut free_list = ptr::NonNull::new(chunk.as_mut_ptr() as _).unwrap();
-            *free_list.as_mut() = SlabFreeList {
-                size: alloc_size,
-                next: Some(self.free_list),
-            };
-            self.free_list = free_list;
-        }
-    }
-
-    /// Returns true if the allocator needs a new chunk. To add the new chunk call `add_chunk`.
-    pub fn needs_new_chunk(&self) -> bool {
-        self.free_size < 64 * Self::SLAB_SIZE
-    }
-
-    /// Allocates a pointer to `T`. Make sure to not leak this memory
-    pub fn malloc(&mut self) -> Option<ptr::NonNull<T>> {
-        unsafe {
-            let SlabFreeList { size, next } = *self.free_list.as_mut();
-            if Self::SLAB_SIZE < size {
-                let ptr = ptr::NonNull::new(self.free_list.as_ptr() as _)?;
-                self.free_list =
-                    ptr::NonNull::new((self.free_list.as_ptr() as usize + Self::SLAB_SIZE) as _)
-                        .unwrap();
-                *self.free_list.as_mut() = SlabFreeList {
-                    size: size - Self::SLAB_SIZE,
-                    next,
-                };
-                self.free_size -= Self::SLAB_SIZE;
-
-                Some(ptr)
-            } else if Self::SLAB_SIZE == size {
-                let ptr = ptr::NonNull::new(self.free_list.as_ptr() as _)?;
-                self.free_list = next?;
-                self.free_size -= Self::SLAB_SIZE;
-
-                Some(ptr)
-            } else {
-                log::error!("Slab allocator free area is too small");
-                self.free_list = next?;
-                self.free_size -= size;
-
-                self.malloc()
-            }
-        }
-    }
-
-    /// Deallocates a pointer to `T`;
-    ///
-    /// # Safety
-    /// `ptr` must point to a value allocated by this slab allocator
-    pub unsafe fn free(&mut self, ptr: ptr::NonNull<T>) {
-        let free_list = self.free_list;
-        self.free_list = ptr::NonNull::new(ptr.as_ptr() as _).unwrap();
-        *self.free_list.as_mut() = SlabFreeList {
-            size: Self::SLAB_SIZE,
-            next: Some(free_list),
-        };
-        self.free_size += Self::SLAB_SIZE;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C, align(16))]
-struct SlabFreeList {
-    size: usize,
-    next: Option<ptr::NonNull<SlabFreeList>>,
-}
+// /// The page deallocator.
+// pub trait PageDeallocator<S: PageSize> {
+//     /// The error type.
+//     type Err;
+//
+//     /// Deallocates a page and returns it's virtual address.
+//     fn deallocate_page(&mut self) -> Result<(), Self::Err>;
+//     /// Deallocates multiple pages continuously.
+//     fn deallocate_pages(&mut self, num: u64) -> Result<(), Self::Err>;
+// }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(16))]

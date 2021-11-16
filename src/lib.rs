@@ -15,10 +15,11 @@
 
 pub mod idt;
 pub mod mem;
+pub mod ref_stack;
 pub mod serial;
+pub mod stack_vec;
 
 use core::panic::PanicInfo;
-use mem::BumpAllocator;
 
 // /// Internal stuff
 // #[doc(hidden)]
