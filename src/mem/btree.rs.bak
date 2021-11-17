@@ -1,4 +1,6 @@
 use super::SlabAllocator;
+use crate::ref_stack::OnStackRefMutStack;
+use crate::stack_vec::StackVec;
 use bitflags::bitflags;
 use core::borrow::Borrow;
 use core::mem::{self, MaybeUninit};
@@ -19,12 +21,14 @@ bitflags! {
     }
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 union ChildUnion<K, V> {
     node: NonNull<Node<K, V>>,
     leaf: NonNull<Leaf<K, V>>,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 enum Child<K, V> {
     Node(NonNull<Node<K, V>>),
@@ -46,6 +50,16 @@ struct Node<K, V> {
     metadata: NodeMetadata,
     children: [MaybeUninit<ChildUnion<K, V>>; MAX_NUM_CHILDREN],
     values: [MaybeUninit<V>; MAX_NUM_ELEMENTS],
+}
+
+impl<K: Ord, V> Child<K, V> {
+    #[inline]
+    pub fn to_child_union(self) -> ChildUnion<K, V> {
+        match self {
+            Self::Node(node) => ChildUnion { node },
+            Self::Leaf(leaf) => ChildUnion { leaf },
+        }
+    }
 }
 
 impl<K: Ord, V> Leaf<K, V> {
@@ -92,6 +106,11 @@ impl<K: Ord, V> Leaf<K, V> {
         )
     }
 
+    #[inline]
+    pub fn as_child(&self) -> Child<K, V> {
+        Child::Leaf(self.into())
+    }
+
     pub fn search<Q>(&self, key: &Q) -> Result<usize, usize>
     where
         K: Borrow<Q>,
@@ -117,7 +136,7 @@ impl<K: Ord, V> Leaf<K, V> {
                 ptr::copy(
                     self.keys.as_ptr().add(index),
                     self.keys.as_mut_ptr().add(index + 1),
-                    self.len(),
+                    self.len() - index,
                 );
                 ptr::copy(
                     self.values.as_ptr().add(index),
@@ -143,7 +162,7 @@ impl<K: Ord, V> Leaf<K, V> {
         assert_eq!(self.len(), MAX_NUM_ELEMENTS);
 
         unsafe {
-            if index <= MIN_NUM_ELEMENTS + 1 {
+            if index < MIN_NUM_ELEMENTS + 2 {
                 let right = right.write(Self {
                     keys: MaybeUninit::uninit().assume_init(),
                     values: MaybeUninit::uninit().assume_init(),
@@ -152,12 +171,12 @@ impl<K: Ord, V> Leaf<K, V> {
                 });
                 self.set_len(MIN_NUM_ELEMENTS + 1);
                 ptr::copy_nonoverlapping(
-                    self.keys.as_ptr().add(self.len()),
+                    self.keys.as_ptr().add(MIN_NUM_ELEMENTS + 1),
                     right.keys.as_mut_ptr(),
                     MIN_NUM_ELEMENTS,
                 );
                 ptr::copy_nonoverlapping(
-                    self.values.as_ptr().add(self.len()),
+                    self.values.as_ptr().add(MIN_NUM_ELEMENTS + 1),
                     right.values.as_mut_ptr(),
                     MIN_NUM_ELEMENTS,
                 );
@@ -178,20 +197,33 @@ impl<K: Ord, V> Leaf<K, V> {
                     len: MIN_NUM_ELEMENTS as _,
                 });
                 self.set_len(MIN_NUM_ELEMENTS + 2);
+                let right_index = index - MIN_NUM_ELEMENTS - 2;
+
                 ptr::copy_nonoverlapping(
-                    self.keys.as_ptr().add(self.len()),
+                    self.keys.as_ptr().add(MIN_NUM_ELEMENTS + 2),
                     right.keys.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS - 1,
+                    right_index,
                 );
                 ptr::copy_nonoverlapping(
-                    self.values.as_ptr().add(self.len()),
-                    right.values.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS - 1,
+                    self.keys.as_ptr().add(index),
+                    right.keys.as_mut_ptr().add(right_index + 1),
+                    MIN_NUM_ELEMENTS - right_index - 1,
                 );
+                right.keys[right_index].write(key);
+
+                ptr::copy_nonoverlapping(
+                    self.values.as_ptr().add(MIN_NUM_ELEMENTS + 2),
+                    right.values.as_mut_ptr(),
+                    right_index,
+                );
+                ptr::copy_nonoverlapping(
+                    self.values.as_ptr().add(index),
+                    right.values.as_mut_ptr().add(right_index + 1),
+                    MIN_NUM_ELEMENTS - right_index - 1,
+                );
+                right.values[right_index].write(value);
 
                 let (sep_key, sep_value) = self.pop_back().unwrap();
-                right.insert(index - MIN_NUM_ELEMENTS - 2, key, value);
-
                 (sep_key, sep_value, right)
             }
         }
@@ -384,6 +416,11 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     #[inline]
+    pub fn as_child(&self) -> Child<K, V> {
+        Child::Node(self.into())
+    }
+
+    #[inline]
     pub fn keys(&self) -> &[K] {
         unsafe { slice::from_raw_parts(self.keys.as_ptr() as _, self.len()) }
     }
@@ -409,6 +446,97 @@ impl<K: Ord, V> Node<K, V> {
             unsafe { slice::from_raw_parts_mut(self.keys.as_mut_ptr() as _, self.len()) },
             unsafe { slice::from_raw_parts_mut(self.values.as_mut_ptr() as _, self.len()) },
         )
+    }
+
+    #[inline]
+    pub fn children_are_nodes(&self) -> bool {
+        self.metadata.contains(NodeMetadata::NODE_CHILDREN)
+    }
+
+    #[inline]
+    pub fn children_are_leafs(&self) -> bool {
+        !self.metadata.contains(NodeMetadata::NODE_CHILDREN)
+    }
+
+    // [MaybeUninit<ChildUnion<K, V>>; MAX_NUM_CHILDREN]
+    #[inline]
+    pub unsafe fn node_children_unchecked(&self) -> &[NonNull<Node<K, V>>] {
+        slice::from_raw_parts(self.children.as_ptr() as _, self.len() + 1)
+    }
+
+    #[inline]
+    pub unsafe fn leaf_children_unchecked(&self) -> &[NonNull<Leaf<K, V>>] {
+        slice::from_raw_parts(self.children.as_ptr() as _, self.len() + 1)
+    }
+
+    #[inline]
+    pub unsafe fn node_children_unchecked_mut(&mut self) -> &mut [NonNull<Node<K, V>>] {
+        slice::from_raw_parts_mut(self.children.as_mut_ptr() as _, self.len() + 1)
+    }
+
+    #[inline]
+    pub unsafe fn leaf_children_unchecked_mut(&mut self) -> &mut [NonNull<Leaf<K, V>>] {
+        slice::from_raw_parts_mut(self.children.as_mut_ptr() as _, self.len() + 1)
+    }
+
+    #[inline]
+    pub fn try_node_children(&self) -> Result<&[NonNull<Node<K, V>>], &[NonNull<Leaf<K, V>>]> {
+        unsafe {
+            if self.children_are_nodes() {
+                Ok(slice::from_raw_parts(
+                    self.children.as_ptr() as _,
+                    self.len() + 1,
+                ))
+            } else {
+                Err(slice::from_raw_parts(
+                    self.children.as_ptr() as _,
+                    self.len() + 1,
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_node_children_mut(
+        &mut self,
+    ) -> Result<&mut [NonNull<Node<K, V>>], &mut [NonNull<Leaf<K, V>>]> {
+        unsafe {
+            if self.children_are_nodes() {
+                Ok(slice::from_raw_parts_mut(
+                    self.children.as_mut_ptr() as _,
+                    self.len() + 1,
+                ))
+            } else {
+                Err(slice::from_raw_parts_mut(
+                    self.children.as_mut_ptr() as _,
+                    self.len() + 1,
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn node_children(&self) -> &[NonNull<Node<K, V>>] {
+        assert!(self.children_are_nodes());
+        unsafe { slice::from_raw_parts(self.children.as_ptr() as _, self.len() + 1) }
+    }
+
+    #[inline]
+    pub fn leaf_children(&self) -> &[NonNull<Leaf<K, V>>] {
+        assert!(self.children_are_leafs());
+        unsafe { slice::from_raw_parts(self.children.as_ptr() as _, self.len() + 1) }
+    }
+
+    #[inline]
+    pub fn node_children_mut(&mut self) -> &mut [NonNull<Node<K, V>>] {
+        assert!(self.children_are_nodes());
+        unsafe { slice::from_raw_parts_mut(self.children.as_mut_ptr() as _, self.len() + 1) }
+    }
+
+    #[inline]
+    pub fn leaf_children_mut(&mut self) -> &mut [NonNull<Leaf<K, V>>] {
+        assert!(self.children_are_leafs());
+        unsafe { slice::from_raw_parts_mut(self.children.as_mut_ptr() as _, self.len() + 1) }
     }
 
     pub fn search<Q>(&self, key: &Q) -> Result<usize, usize>
@@ -474,8 +602,75 @@ impl<K: Ord, V> Node<K, V> {
     ) -> (K, V, &'a mut Self) {
         assert_eq!(self.len(), MAX_NUM_ELEMENTS);
 
+        // unsafe {
+        //     if index <= MIN_NUM_ELEMENTS + 1 {
+        //         let right = right.write(Self {
+        //             keys: MaybeUninit::uninit().assume_init(),
+        //             values: MaybeUninit::uninit().assume_init(),
+        //             children: MaybeUninit::uninit().assume_init(),
+        //             metadata: self.metadata,
+        //             len: MIN_NUM_ELEMENTS as _,
+        //         });
+        //         self.set_len(MIN_NUM_ELEMENTS + 1);
+        //         ptr::copy_nonoverlapping(
+        //             self.keys.as_ptr().add(self.len()),
+        //             right.keys.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS,
+        //         );
+        //         ptr::copy_nonoverlapping(
+        //             self.values.as_ptr().add(self.len()),
+        //             right.values.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS,
+        //         );
+        //         ptr::copy_nonoverlapping(
+        //             self.children.as_ptr().add(self.len()),
+        //             right.children.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS + 1,
+        //         );
+
+        //         if index == MIN_NUM_ELEMENTS + 1 {
+        //             right.children[0].write(right_child);
+        //             (key, value, right)
+        //         } else {
+        //             let (sep_key, sep_value, _) = self.pop_back().unwrap();
+        //             self.insert(index, key, value, right_child);
+
+        //             (sep_key, sep_value, right)
+        //         }
+        //     } else {
+        //         let right = right.write(Self {
+        //             keys: MaybeUninit::uninit().assume_init(),
+        //             values: MaybeUninit::uninit().assume_init(),
+        //             children: MaybeUninit::uninit().assume_init(),
+        //             metadata: self.metadata,
+        //             len: MIN_NUM_ELEMENTS as _,
+        //         });
+        //         self.set_len(MIN_NUM_ELEMENTS + 2);
+        //         ptr::copy_nonoverlapping(
+        //             self.keys.as_ptr().add(self.len()),
+        //             right.keys.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS - 1,
+        //         );
+        //         ptr::copy_nonoverlapping(
+        //             self.values.as_ptr().add(self.len()),
+        //             right.values.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS - 1,
+        //         );
+        //         ptr::copy_nonoverlapping(
+        //             self.children.as_ptr().add(self.len()),
+        //             right.children.as_mut_ptr(),
+        //             MIN_NUM_ELEMENTS,
+        //         );
+
+        //         let (sep_key, sep_value, _) = self.pop_back().unwrap();
+        //         right.insert(index - MIN_NUM_ELEMENTS - 2, key, value, right_child);
+
+        //         (sep_key, sep_value, right)
+        //     }
+        // }
+
         unsafe {
-            if index <= MIN_NUM_ELEMENTS + 1 {
+            if index < MIN_NUM_ELEMENTS + 2 {
                 let right = right.write(Self {
                     keys: MaybeUninit::uninit().assume_init(),
                     values: MaybeUninit::uninit().assume_init(),
@@ -485,26 +680,29 @@ impl<K: Ord, V> Node<K, V> {
                 });
                 self.set_len(MIN_NUM_ELEMENTS + 1);
                 ptr::copy_nonoverlapping(
-                    self.keys.as_ptr().add(self.len()),
+                    self.keys.as_ptr().add(MIN_NUM_ELEMENTS + 1),
                     right.keys.as_mut_ptr(),
                     MIN_NUM_ELEMENTS,
                 );
                 ptr::copy_nonoverlapping(
-                    self.values.as_ptr().add(self.len()),
+                    self.values.as_ptr().add(MIN_NUM_ELEMENTS + 1),
                     right.values.as_mut_ptr(),
                     MIN_NUM_ELEMENTS,
                 );
                 ptr::copy_nonoverlapping(
-                    self.children.as_ptr().add(self.len()),
+                    self.children.as_ptr().add(MIN_NUM_CHILDREN),
                     right.children.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS + 1,
+                    MIN_NUM_CHILDREN,
                 );
 
                 if index == MIN_NUM_ELEMENTS + 1 {
                     right.children[0].write(right_child);
+
                     (key, value, right)
                 } else {
-                    let (sep_key, sep_value, _) = self.pop_back().unwrap();
+                    let (sep_key, sep_value, sep_right_child) = self.pop_back().unwrap();
+                    mem::forget(sep_right_child);
+
                     self.insert(index, key, value, right_child);
 
                     (sep_key, sep_value, right)
@@ -518,24 +716,46 @@ impl<K: Ord, V> Node<K, V> {
                     len: MIN_NUM_ELEMENTS as _,
                 });
                 self.set_len(MIN_NUM_ELEMENTS + 2);
-                ptr::copy_nonoverlapping(
-                    self.keys.as_ptr().add(self.len()),
-                    right.keys.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS - 1,
-                );
-                ptr::copy_nonoverlapping(
-                    self.values.as_ptr().add(self.len()),
-                    right.values.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS - 1,
-                );
-                ptr::copy_nonoverlapping(
-                    self.children.as_ptr().add(self.len()),
-                    right.children.as_mut_ptr(),
-                    MIN_NUM_ELEMENTS,
-                );
+                let right_index = index - MIN_NUM_ELEMENTS - 2;
 
-                let (sep_key, sep_value, _) = self.pop_back().unwrap();
-                right.insert(index - MIN_NUM_ELEMENTS - 2, key, value, right_child);
+                ptr::copy_nonoverlapping(
+                    self.keys.as_ptr().add(MIN_NUM_ELEMENTS + 2),
+                    right.keys.as_mut_ptr(),
+                    right_index,
+                );
+                ptr::copy_nonoverlapping(
+                    self.keys.as_ptr().add(index),
+                    right.keys.as_mut_ptr().add(right_index + 1),
+                    MIN_NUM_ELEMENTS - right_index - 1,
+                );
+                right.keys[right_index].write(key);
+
+                ptr::copy_nonoverlapping(
+                    self.values.as_ptr().add(MIN_NUM_ELEMENTS + 2),
+                    right.values.as_mut_ptr(),
+                    right_index,
+                );
+                ptr::copy_nonoverlapping(
+                    self.values.as_ptr().add(index),
+                    right.values.as_mut_ptr().add(right_index + 1),
+                    MIN_NUM_ELEMENTS - right_index - 1,
+                );
+                right.values[right_index].write(value);
+
+                ptr::copy_nonoverlapping(
+                    self.children.as_ptr().add(MIN_NUM_CHILDREN + 1),
+                    right.children.as_mut_ptr(),
+                    right_index + 1,
+                );
+                ptr::copy_nonoverlapping(
+                    self.children.as_ptr().add(index + 1),
+                    right.children.as_mut_ptr().add(right_index + 2),
+                    MIN_NUM_CHILDREN - right_index - 2,
+                );
+                right.children[right_index + 1].write(right_child);
+
+                let (sep_key, sep_value, sep_right_child) = self.pop_back().unwrap();
+                mem::forget(sep_right_child);
 
                 (sep_key, sep_value, right)
             }
@@ -773,7 +993,117 @@ impl<K: Ord, V> BTreeMap<K, V> {
         unsafe {
             match self.root {
                 Root::Node(mut node) => {
-                    todo!()
+                    let mut node_stack = OnStackRefMutStack::<_, 32>::with_root(node.as_mut());
+                    let mut children_indices_stack = StackVec::<_, 32>::new();
+
+                    let (mut sep_idx, mut sep_key, mut sep_value, mut sep_right_child) = 'find_loop: loop {
+                        let node = node_stack.peek_mut().unwrap();
+                        match node.search(&key) {
+                            Ok(idx) => {
+                                return Some((
+                                    key,
+                                    mem::replace(&mut node.values_mut()[idx], value),
+                                ))
+                            }
+                            Err(idx) => {
+                                if node.children_are_nodes() {
+                                    assert!(children_indices_stack.push(idx).is_none());
+                                    assert!(node_stack.push(|node| node
+                                        .node_children_unchecked_mut()[idx]
+                                        .as_mut()));
+                                } else {
+                                    let leaf_children = node.leaf_children_unchecked_mut();
+                                    match leaf_children[idx].as_ref().search(&key) {
+                                        Ok(leaf_idx) => {
+                                            return Some((
+                                                key,
+                                                mem::replace(
+                                                    &mut leaf_children[idx].as_mut().values_mut()
+                                                        [leaf_idx],
+                                                    value,
+                                                ),
+                                            ))
+                                        }
+                                        Err(leaf_idx) => {
+                                            if !leaf_children[idx].as_ref().is_full() {
+                                                leaf_children[idx].as_mut().insert(idx, key, value);
+                                                return None;
+                                            } else {
+                                                if 0 < idx
+                                                    && !leaf_children[idx - 1].as_ref().is_full()
+                                                {
+                                                    let (overflow_key, overflow_value) =
+                                                        leaf_children[idx]
+                                                            .as_mut()
+                                                            .insert_overflow_front(
+                                                                leaf_idx, key, value,
+                                                            );
+                                                    leaf_children[idx - 1]
+                                                        .as_mut()
+                                                        .push_back(overflow_key, overflow_value);
+                                                    return None;
+                                                } else if leaf_children
+                                                    .get(idx + 1)
+                                                    .map(|child| !child.as_ref().is_full())
+                                                    .unwrap_or(false)
+                                                {
+                                                    let (overflow_key, overflow_value) =
+                                                        leaf_children[idx]
+                                                            .as_mut()
+                                                            .insert_overflow_back(
+                                                                leaf_idx, key, value,
+                                                            );
+                                                    leaf_children[idx + 1]
+                                                        .as_mut()
+                                                        .push_front(overflow_key, overflow_value);
+                                                    return None;
+                                                } else {
+                                                    let (sep_key, sep_value, sep_right_child) =
+                                                        leaf_children[idx].as_mut().insert_split(
+                                                            leaf_idx,
+                                                            key,
+                                                            value,
+                                                            self.leaf_alloc
+                                                                .malloc()
+                                                                .unwrap()
+                                                                .cast()
+                                                                .as_mut(),
+                                                        );
+                                                    if !node.is_full() {
+                                                        node.insert(
+                                                            idx,
+                                                            sep_key,
+                                                            sep_value,
+                                                            sep_right_child
+                                                                .as_child()
+                                                                .to_child_union(),
+                                                        );
+                                                        return None;
+                                                    } else {
+                                                        break 'find_loop (
+                                                            idx,
+                                                            sep_key,
+                                                            sep_value,
+                                                            sep_right_child
+                                                                .as_child()
+                                                                .to_child_union(),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    while let Some(idx) = children_indices_stack.pop() {
+                        let node = node_stack.peek_mut().unwrap();
+
+                        if node.children_are_nodes
+                    }
+                    todo!();
                 }
                 Root::Leaf(mut root) => {
                     let root = root.as_mut();

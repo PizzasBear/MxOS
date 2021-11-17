@@ -308,6 +308,7 @@ impl<'a, T, const N: usize> Drop for OuterLenStackVecDrain<'a, T, N> {
     }
 }
 
+#[repr(C)]
 pub struct StackVec<T, const N: usize> {
     _data: OuterLenStackVec<T, N>,
     _len: usize,

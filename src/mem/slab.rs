@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
-use core::mem::size_of;
-use core::ptr;
+use core::mem::{self, size_of};
+use core::{fmt, ops, ptr};
 
 /// A slab allocator, that allocates only type T. It needs a page allocator, but it never
 /// deallocates.
@@ -72,7 +72,8 @@ impl<T: Sized> SlabAllocator<T> {
         self.free_size < 64 * Self::SLAB_SIZE
     }
 
-    /// Allocates a pointer to `T`. Make sure to not leak this memory
+    /// Allocates a pointer to `T`. Make sure to not leak this memory.
+    /// Using this function directly is not recommended, please use `SlabBox::<T>::new(slf, data)` instead.
     pub fn malloc(&mut self) -> Option<ptr::NonNull<T>> {
         unsafe {
             let SlabFreeList { size, next } = *self.free_list.as_mut();
@@ -104,7 +105,7 @@ impl<T: Sized> SlabAllocator<T> {
     /// Deallocates a pointer to `T`;
     ///
     /// # Safety
-    /// `ptr` must point to a value allocated by this slab allocator
+    /// `ptr` must point to a value allocated by a slab allocator.
     pub unsafe fn free(&mut self, ptr: ptr::NonNull<T>) {
         let free_list = self.free_list;
         self.free_list = ptr::NonNull::new(ptr.as_ptr() as _).unwrap();
@@ -113,6 +114,126 @@ impl<T: Sized> SlabAllocator<T> {
             next: Some(free_list),
         };
         self.free_size += Self::SLAB_SIZE;
+    }
+}
+
+/// Represents a box allocated by a slab allocator.
+#[repr(transparent)]
+pub struct SlabBox<T> {
+    ptr: ptr::NonNull<T>,
+    phantom: PhantomData<T>,
+}
+
+impl<T> SlabBox<T> {
+    /// Allocates the box from the given slab allocator and moves x to it.
+    #[inline]
+    pub fn new(alloc: &mut SlabAllocator<T>, x: T) -> Self {
+        unsafe {
+            let ptr = alloc.malloc().expect("Failed to allocate");
+            ptr.cast::<mem::MaybeUninit<T>>().as_mut().write(x);
+            Self {
+                ptr,
+                phantom: PhantomData,
+            }
+        }
+    }
+
+    /// Frees the allocation with the given allocator. This allocator doesn't have to be the same
+    /// allocator that was used to allocate this box, but it's not recommended to use a different
+    /// allocator or multiple slab allocators of the same type in general.
+    #[inline]
+    pub fn free(self, alloc: &mut SlabAllocator<T>) {
+        unsafe {
+            let md = mem::ManuallyDrop::new(self);
+            md.ptr.as_ptr().drop_in_place();
+            alloc.free(md.ptr);
+        }
+    }
+
+    /// Does the same thing as `free` but without dropping the data inside.
+    #[inline]
+    pub fn free_forget(self, alloc: &mut SlabAllocator<T>) {
+        unsafe {
+            let md = mem::ManuallyDrop::new(self);
+            alloc.free(md.ptr);
+        }
+    }
+
+    /// Does the same thing as `free` but moves the data and returns it.
+    #[inline]
+    pub fn move_free(self, alloc: &mut SlabAllocator<T>) -> T {
+        let x;
+        unsafe {
+            let md = mem::ManuallyDrop::new(self);
+            x = md.ptr.as_ptr().read();
+            alloc.free(md.ptr);
+        }
+        x
+    }
+
+    /// Clones the box, does the same thing as
+    /// ```
+    /// // slf: SlabBox<T>
+    /// // alloc: &mut SlabAllocator<T>
+    /// SlabBox::new(alloc, slf.as_ref().clone())
+    /// ```
+    #[inline]
+    pub fn clone(&self, alloc: &mut SlabAllocator<T>) -> Self
+    where
+        T: Clone,
+    {
+        Self::new(alloc, self.as_ref().clone())
+    }
+}
+
+impl<T> AsRef<T> for SlabBox<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        &*self
+    }
+}
+
+impl<T> AsMut<T> for SlabBox<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        &mut *self
+    }
+}
+
+impl<T> ops::Deref for SlabBox<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T> ops::DerefMut for SlabBox<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<T> Drop for SlabBox<T> {
+    #[inline]
+    fn drop(&mut self) {
+        panic!("A slab box was dropped resulting in a leak.");
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for SlabBox<T> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SlabBox<T> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_ref().fmt(f)
     }
 }
 

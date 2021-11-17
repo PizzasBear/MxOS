@@ -63,7 +63,7 @@ use core::mem;
 //     pub fn push<F: FnOnce(&'a mut T) -> &'a mut T>(&mut self, f: F) -> bool {
 //         unsafe {
 //             let x = match self.0.last_mut() {
-//                 Some(x) => &mut *(*x as *mut T),
+//                 Some(x) => &mut **x,
 //                 None => return false,
 //             };
 //             self.0.push(f(x));
@@ -75,7 +75,7 @@ use core::mem;
 //     // pub fn try_push<F: FnOnce(&'a mut T) -> Option<&'a mut T>>(&mut self, f: F) -> bool {
 //     //     unsafe {
 //     //         let x = match self.0.last_mut() {
-//     //             Some(x) => &mut *(*x as *mut T),
+//     //             Some(x) => &mut **x,
 //     //             None => return false,
 //     //         };
 //     //         self.0.push(match f(x) {
@@ -94,7 +94,7 @@ use core::mem;
 //     {
 //         unsafe {
 //             let x = match self.0.last_mut() {
-//                 Some(x) => &mut *(*x as *mut T),
+//                 Some(x) => &mut **x,
 //                 None => return Ok(false),
 //             };
 //             self.0.push(match f(x) {
@@ -172,7 +172,7 @@ impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
         } else {
             unsafe {
                 let x = match self.0.last_mut() {
-                    Some(x) => &mut *(*x as *mut T),
+                    Some(x) => &mut **x,
                     None => return false,
                 };
                 assert!(self.0.push(f(x)).is_none());
@@ -185,7 +185,7 @@ impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
     // pub fn try_push<F: FnOnce(&'a mut T) -> Option<&'a mut T>>(&mut self, f: F) -> bool {
     //     unsafe {
     //         let x = match self.0.last_mut() {
-    //             Some(x) => &mut *(*x as *mut T),
+    //             Some(x) => &mut **x,
     //             None => return false,
     //         };
     //         self.0.push(match f(x) {
@@ -195,33 +195,6 @@ impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
     //         true
     //     }
     // }
-
-    /// Trys to push
-    #[inline]
-    pub fn try_push<'b, E, F>(&'b mut self, f: F) -> Result<bool, E>
-    where
-        E: 'b,
-        F: FnOnce(&'a mut T) -> Result<&'a mut T, E>,
-    {
-        if self.0.is_full() {
-            Ok(false)
-        } else {
-            unsafe {
-                let x = match self.0.last_mut() {
-                    Some(x) => &mut **x,
-                    None => return Ok(false),
-                };
-                assert!(self
-                    .0
-                    .push(match f(x) {
-                        Ok(x) => x,
-                        Err(e) => return Err(e),
-                    })
-                    .is_none());
-                Ok(true)
-            }
-        }
-    }
 
     /// `self.pop()` returns `Some` only if the root was popped, otherwise it returns `None`
     #[inline]

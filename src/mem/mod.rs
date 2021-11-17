@@ -5,8 +5,9 @@ mod btree;
 mod bump;
 mod slab;
 
-pub use slab::SlabAllocator;
+pub use slab::{SlabAllocator, SlabBox};
 
+use btree::BTree;
 use bump::BumpAllocator;
 
 use core::mem::MaybeUninit;
@@ -219,6 +220,7 @@ const GLOBAL_BUDDY_DEPTH: usize = 8;
 /// The global binary buddy memory allocator
 pub struct GlobalBuddyAllocator {
     buddy_alloc: BuddyAllocator<GLOBAL_BUDDY_DEPTH>,
+    virt_addr_alloc: BTree<usize, u64>,
     page_table_alloc: SlabAllocator<PageTable>,
 }
 
