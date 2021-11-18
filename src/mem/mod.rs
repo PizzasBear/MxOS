@@ -35,16 +35,16 @@ use x86_64::structures::paging::{FrameAllocator, PageSize, PageTable, Size2MiB};
 //     fn deallocate_pages(&mut self, num: u64) -> Result<(), Self::Err>;
 // }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 #[repr(C, align(16))]
 struct BuddyFreeList {
     ptr: usize,
-    next: Option<ptr::NonNull<BuddyFreeList>>,
+    next: Option<SlabBox<BuddyFreeList>>,
 }
 
 struct Buddies {
     bitmap: &'static mut [u64],
-    free_list: Option<ptr::NonNull<BuddyFreeList>>,
+    free_list: Option<SlabBox<BuddyFreeList>>,
     num_buddies: usize,
 }
 
@@ -57,59 +57,59 @@ struct BuddyAllocator<const N: usize> {
 
 impl<const N: usize> BuddyAllocator<N> {
     pub fn malloc(&mut self, order: usize) -> Option<usize> {
-        unsafe {
-            let order_buddy_size = self.base_size << order;
+        let order_buddy_size = self.base_size << order;
 
-            while let Some(free_list) = self.buddies[order].free_list {
-                let BuddyFreeList { ptr, next } = *free_list.as_ref();
-                self.buddies[order].free_list = next;
+        while let Some(free_list) = self.buddies[order].free_list.take() {
+            let BuddyFreeList { ptr, next } = free_list.free_move(&mut self.free_list_alloc);
+            self.buddies[order].free_list = next;
 
-                self.free_list_alloc.free(free_list);
-
-                let chunk_ptr = ptr / (self.base_size << order);
-                if self.buddies[order].bitmap[chunk_ptr >> 6] & 1 << (chunk_ptr & 63) != 0 {
-                    continue;
-                }
-
-                self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63);
-                return Some(self.offset + ptr);
+            let chunk_ptr = ptr / (self.base_size << order);
+            if self.buddies[order].bitmap[chunk_ptr >> 6] & 1 << (chunk_ptr & 63) != 0 {
+                continue;
             }
 
-            if order == self.buddies.len() - 1 {
-                None
-            } else {
-                let ptr = self.malloc(order + 1)?;
+            self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63);
+            return Some(self.offset + ptr);
+        }
 
-                let chunk_ptr = (ptr - self.offset) / order_buddy_size;
-                self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr + 1 & 63);
+        if order == self.buddies.len() - 1 {
+            None
+        } else {
+            let ptr = self.malloc(order + 1)?;
 
-                Some(ptr)
-            }
+            let chunk_ptr = (ptr - self.offset) / order_buddy_size;
+            self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr + 1 & 63);
+
+            Some(ptr)
         }
     }
 
     pub fn free(&mut self, ptr: usize, order: usize) {
-        unsafe {
-            let chunk_ptr = (ptr - self.offset) / (self.base_size << order);
-            if order < self.buddies.len() - 1
-                && self.buddies[order].bitmap[chunk_ptr >> 6] & 1 << (chunk_ptr & 63 ^ 1) == 0
-            {
-                self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63 ^ 1);
+        let chunk_ptr = (ptr - self.offset) / (self.base_size << order);
+        if order < self.buddies.len() - 1
+            && self.buddies[order].bitmap[chunk_ptr >> 6] & 1 << (chunk_ptr & 63 ^ 1) == 0
+        {
+            self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63 ^ 1);
 
-                self.free(ptr, order + 1);
-            } else {
-                self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63);
+            self.free(ptr, order + 1);
+        } else {
+            self.buddies[order].bitmap[chunk_ptr >> 6] ^= 1 << (chunk_ptr & 63);
 
-                let mut free_list = self
-                    .free_list_alloc
-                    .malloc()
-                    .expect("Failed to allocate new buddy free list");
-                *free_list.as_mut() = BuddyFreeList {
+            // let mut free_list = self
+            //     .free_list_alloc
+            //     .malloc()
+            //     .expect("Failed to allocate new buddy free list");
+            // *free_list.as_mut() = BuddyFreeList {
+            //     ptr: ptr - self.offset,
+            //     next: self.buddies[order].free_list,
+            // };
+            self.buddies[order].free_list = Some(SlabBox::new(
+                &mut self.free_list_alloc,
+                BuddyFreeList {
                     ptr: ptr - self.offset,
-                    next: self.buddies[order].free_list,
-                };
-                self.buddies[order].free_list = Some(free_list);
-            }
+                    next: self.buddies[order].free_list.take(),
+                },
+            ));
         }
     }
 
@@ -137,12 +137,18 @@ impl<const N: usize> BuddyAllocator<N> {
                     let bitmap = &mut self.buddies[order].bitmap;
                     if bitmap[ptr >> 6] & 1 << (ptr & 63) != 0 {
                         if ptr & 1 == 1 {
-                            let mut free_list = self.free_list_alloc.malloc().unwrap();
-                            *free_list.as_mut() = BuddyFreeList {
-                                ptr: self.offset + self.base_size * (ptr - 1 << order),
-                                next: self.buddies[order].free_list,
-                            };
-                            self.buddies[order].free_list = Some(free_list);
+                            // let mut free_list = self.free_list_alloc.malloc().unwrap();
+                            // *free_list.as_mut() = BuddyFreeList {
+                            //     ptr: self.offset + self.base_size * (ptr - 1 << order),
+                            //     next: self.buddies[order].free_list,
+                            // };
+                            self.buddies[order].free_list = Some(SlabBox::new(
+                                &mut self.free_list_alloc,
+                                BuddyFreeList {
+                                    ptr: self.offset + self.base_size * (ptr - 1 << order),
+                                    next: self.buddies[order].free_list.take(),
+                                },
+                            ));
                             // flips 1 to 0
                             bitmap[ptr >> 6] ^= 1 << (ptr - 1 & 63);
                         }
@@ -168,12 +174,18 @@ impl<const N: usize> BuddyAllocator<N> {
                     let bitmap = &mut self.buddies[order].bitmap;
                     if bitmap[ptr >> 6] & 1 << (ptr & 63) != 0 {
                         if ptr & 1 == 0 {
-                            let mut free_list = self.free_list_alloc.malloc().unwrap();
-                            *free_list.as_mut() = BuddyFreeList {
-                                ptr: self.offset + self.base_size * (ptr + 1 << order),
-                                next: self.buddies[order].free_list,
-                            };
-                            self.buddies[order].free_list = Some(free_list);
+                            // let mut free_list = self.free_list_alloc.malloc().unwrap();
+                            // *free_list.as_mut() = BuddyFreeList {
+                            //     ptr: self.offset + self.base_size * (ptr + 1 << order),
+                            //     next: self.buddies[order].free_list,
+                            // };
+                            self.buddies[order].free_list = Some(SlabBox::new(
+                                &mut self.free_list_alloc,
+                                BuddyFreeList {
+                                    ptr: self.offset + self.base_size * (ptr + 1 << order),
+                                    next: self.buddies[order].free_list.take(),
+                                },
+                            ));
                             // flips 1 to 0
                             bitmap[ptr >> 6] ^= 1 << (ptr + 1 & 63);
                         }
@@ -289,16 +301,22 @@ impl GlobalBuddyAllocator {
 
         let top_buddies = &mut buddy_alloc.buddies[GLOBAL_BUDDY_DEPTH - 1];
         for i in (0..top_buddies.bitmap.len() * 8).rev() {
-            let mut free_list = buddy_alloc
-                .free_list_alloc
-                .malloc()
-                .expect("Failed to allocate a free list");
+            // let mut free_list = buddy_alloc
+            //     .free_list_alloc
+            //     .malloc()
+            //     .expect("Failed to allocate a free list");
 
-            *free_list.as_mut() = BuddyFreeList {
-                ptr: (TOP_BLOCK_SIZE * i) as _,
-                next: top_buddies.free_list,
-            };
-            top_buddies.free_list = Some(free_list);
+            // *free_list.as_mut() = BuddyFreeList {
+            //     ptr: (TOP_BLOCK_SIZE * i) as _,
+            //     next: top_buddies.free_list,
+            // };
+            top_buddies.free_list = Some(SlabBox::new(
+                &mut buddy_alloc.free_list_alloc,
+                BuddyFreeList {
+                    ptr: (TOP_BLOCK_SIZE * i) as _,
+                    next: top_buddies.free_list.take(),
+                },
+            ));
         }
         buddy_alloc.mark_as_used(kernel_start, kernel_end);
         buddy_alloc.mark_as_used(boot_info.start_address(), boot_info.end_address());
@@ -312,15 +330,39 @@ impl GlobalBuddyAllocator {
         );
         buddy_alloc.mark_as_used(0, 0x200000);
 
+        let page_table_alloc_chunk = buddy_alloc.malloc(0).unwrap();
         let page_table_alloc = SlabAllocator::new(slice::from_raw_parts_mut(
-            buddy_alloc.malloc(0).unwrap() as _,
+            page_table_alloc_chunk as _,
             buddy_alloc.base_size,
         ));
+
+        let virt_addr_alloc_chunk = buddy_alloc.malloc(0).unwrap();
+        let mut virt_addr_alloc = BTree::new(slice::from_raw_parts_mut(
+            virt_addr_alloc_chunk as _,
+            buddy_alloc.base_size,
+        ));
+
+        let addr = [
+            boot_info.end_address(),
+            kernel_end,
+            (buddies_frame.start_address().as_u64() + buddies_frame.size()) as usize,
+            (free_list_alloc_frame.start_address().as_u64() + free_list_alloc_frame.size())
+                as usize,
+            page_table_alloc_chunk + buddy_alloc.base_size,
+            virt_addr_alloc_chunk + buddy_alloc.base_size,
+        ]
+        .iter()
+        .copied()
+        .max()
+        .unwrap();
+        virt_addr_alloc.insert((1 << 48) - addr, addr as _);
 
         Self {
             buddy_alloc,
             page_table_alloc,
+            virt_addr_alloc,
         }
+        // How do you modify page tables through their physical address?
     }
 }
 

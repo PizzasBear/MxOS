@@ -161,7 +161,7 @@ impl<T> SlabBox<T> {
 
     /// Does the same thing as `free` but moves the data and returns it.
     #[inline]
-    pub fn move_free(self, alloc: &mut SlabAllocator<T>) -> T {
+    pub fn free_move(self, alloc: &mut SlabAllocator<T>) -> T {
         let x;
         unsafe {
             let md = mem::ManuallyDrop::new(self);
