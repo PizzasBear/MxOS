@@ -138,6 +138,16 @@ impl<T> SlabBox<T> {
         }
     }
 
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+
     /// Frees the allocation with the given allocator. This allocator doesn't have to be the same
     /// allocator that was used to allocate this box, but it's not recommended to use a different
     /// allocator or multiple slab allocators of the same type in general.

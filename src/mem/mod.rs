@@ -232,8 +232,8 @@ const GLOBAL_BUDDY_DEPTH: usize = 8;
 /// The global binary buddy memory allocator
 pub struct GlobalBuddyAllocator {
     buddy_alloc: BuddyAllocator<GLOBAL_BUDDY_DEPTH>,
-    virt_addr_alloc: BTree<usize, u64>,
-    page_table_alloc: SlabAllocator<PageTable>,
+    virt_addr_alloc: BTree<(usize, usize), ()>,
+    pml4_table: PageTable,
 }
 
 impl GlobalBuddyAllocator {
@@ -319,22 +319,22 @@ impl GlobalBuddyAllocator {
             ));
         }
         buddy_alloc.mark_as_used(kernel_start, kernel_end);
-        buddy_alloc.mark_as_used(boot_info.start_address(), boot_info.end_address());
+        if boot_info.end_address() + 0x1fffff & !0x1fffff <= kernel_start & !0x1fffff
+            || kernel_end + 0x1fffff & !0x1fffff <= boot_info.start_address() & 0x1fffff
+        {
+            buddy_alloc.mark_as_used(boot_info.start_address(), boot_info.end_address());
+        }
         buddy_alloc.mark_as_used(
             buddies_frame.start_address().as_u64() as _,
-            (buddies_frame.start_address().as_u64() + Size2MiB::SIZE) as _,
+            (buddies_frame.start_address().as_u64() + buddies_frame.size()) as _,
         );
         buddy_alloc.mark_as_used(
             free_list_alloc_frame.start_address().as_u64() as _,
-            (free_list_alloc_frame.start_address().as_u64() + Size2MiB::SIZE) as _,
+            (free_list_alloc_frame.start_address().as_u64() + free_list_alloc_frame.size()) as _,
         );
-        buddy_alloc.mark_as_used(0, 0x200000);
-
-        let page_table_alloc_chunk = buddy_alloc.malloc(0).unwrap();
-        let page_table_alloc = SlabAllocator::new(slice::from_raw_parts_mut(
-            page_table_alloc_chunk as _,
-            buddy_alloc.base_size,
-        ));
+        if 0x200000 <= kernel_start {
+            buddy_alloc.mark_as_used(0, 0x200000);
+        }
 
         let virt_addr_alloc_chunk = buddy_alloc.malloc(0).unwrap();
         let mut virt_addr_alloc = BTree::new(slice::from_raw_parts_mut(
@@ -342,27 +342,60 @@ impl GlobalBuddyAllocator {
             buddy_alloc.base_size,
         ));
 
-        let addr = [
-            boot_info.end_address(),
-            kernel_end,
+        let mut start_addresses = [
+            boot_info.end_address() + 0x1fffff & !0x1fffff,
+            kernel_end + 0x1fffff & !0x1fffff,
             (buddies_frame.start_address().as_u64() + buddies_frame.size()) as usize,
             (free_list_alloc_frame.start_address().as_u64() + free_list_alloc_frame.size())
                 as usize,
-            page_table_alloc_chunk + buddy_alloc.base_size,
             virt_addr_alloc_chunk + buddy_alloc.base_size,
-        ]
-        .iter()
-        .copied()
-        .max()
-        .unwrap();
-        virt_addr_alloc.insert((1 << 48) - addr, addr as _);
+            (1 << 48) - (1 << 30) - (1 << 21),
+        ];
+        let mut end_addresses = [
+            boot_info.start_address() & !0x1fffff,
+            kernel_start & !0x1fffff,
+            buddies_frame.start_address().as_u64() as usize,
+            free_list_alloc_frame.start_address().as_u64() as usize,
+            virt_addr_alloc_chunk,
+            1 << 48,
+        ];
+        start_addresses.sort_unstable();
+        end_addresses.sort_unstable();
+
+        {
+            let mut i = 0;
+            let mut j = 0;
+            let mut depth = 0;
+            let mut last_end = 0x200000;
+
+            while i < start_addresses.len() && j < end_addresses.len() {
+                if start_addresses[i] < end_addresses[j] {
+                    if depth == 0 && last_end < start_addresses[i] {
+                        assert!(virt_addr_alloc
+                            .insert((start_addresses[i] - last_end, start_addresses[i]), ())
+                            .is_none());
+                    }
+                    depth += 1;
+                    i += 1;
+                } else if end_addresses[j] < start_addresses[i] {
+                    last_end = end_addresses[j];
+
+                    depth -= 1;
+                    j += 1;
+                } else {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+
+        let mut pml4_table = PageTable::new();
 
         Self {
             buddy_alloc,
-            page_table_alloc,
             virt_addr_alloc,
+            pml4_table,
         }
-        // How do you modify page tables through their physical address?
     }
 }
 

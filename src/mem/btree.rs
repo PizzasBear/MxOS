@@ -9,9 +9,8 @@ use crate::{
 };
 use core::borrow::Borrow;
 use core::cmp::Ordering;
+use core::marker::PhantomData;
 use core::{fmt, mem, ops, ptr, slice};
-
-// use core::marker::PhantomData;
 
 const B: usize = 6;
 
@@ -19,6 +18,8 @@ const MIN_NUM_ELEMENTS: usize = B - 1;
 const MAX_NUM_ELEMENTS: usize = 2 * B - 1;
 const MIN_NUM_CHILDREN: usize = B;
 const MAX_NUM_CHILDREN: usize = 2 * B;
+
+const MAX_DEPTH: usize = 20;
 
 trait OptionExt {
     fn assert_none(&self);
@@ -1904,6 +1905,79 @@ impl<K: Ord, V> BTree<K, V> {
         }
     }
 
+    pub fn get_entry<Q>(&self, key: &Q) -> Result<BTreeEntry<K, V>, BTreeEntry<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut entry = match self.root.as_ref() {
+            ChildRef::Node(root) => {
+                let mut node_stack = StackVec::new();
+                node_stack.push(root).assert_none();
+                BTreeEntry {
+                    node_stack,
+                    index_stack: StackVec::new(),
+                    leaf: None,
+                }
+            }
+            ChildRef::Leaf(root) => BTreeEntry {
+                node_stack: StackVec::new(),
+                index_stack: StackVec::new(),
+                leaf: Some(root),
+            },
+        };
+        loop {
+            match entry.leaf {
+                Some(leaf) => {
+                    for (i, elem_k) in leaf.keys().iter().enumerate() {
+                        let ord = key.cmp(elem_k.borrow());
+                        match ord {
+                            Ordering::Less => {
+                                entry.index_stack.push(i).assert_none();
+                                return Err(entry);
+                            }
+                            Ordering::Equal => {
+                                entry.index_stack.push(i).assert_none();
+                                return Ok(entry);
+                            }
+                            Ordering::Greater => {}
+                        }
+                    }
+                    entry.index_stack.push(leaf.len() - 1).assert_none();
+                    return Ok(entry);
+                }
+                None => {
+                    let node = *entry.node_stack.last().unwrap();
+                    let mut idx = node.num_elements() - 1;
+
+                    for (i, elem_k) in node.keys().iter().enumerate() {
+                        let ord = key.cmp(elem_k.borrow());
+                        match ord {
+                            Ordering::Less => {
+                                idx = i;
+                                break;
+                            }
+                            Ordering::Equal => {
+                                entry.index_stack.push(i).assert_none();
+                                return Ok(entry);
+                            }
+                            Ordering::Greater => {}
+                        }
+                    }
+                    entry.index_stack.push(idx).assert_none();
+                    match node.children() {
+                        ChildrenSlice::Nodes(children) => {
+                            entry.node_stack.push(children[idx].as_ref()).assert_none();
+                        }
+                        ChildrenSlice::Leafs(children) => {
+                            entry.leaf = Some(children[idx].as_ref());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
@@ -1985,8 +2059,8 @@ impl<K: Ord, V> BTree<K, V> {
                 return None;
             }
             Child::Node(root) => {
-                let mut ref_stack = OnStackRefMutStack::<Node<K, V>, 20>::new();
-                let mut children_indices_stack = StackVec::<usize, 20>::new(); // ;
+                let mut ref_stack = OnStackRefMutStack::<Node<K, V>, MAX_DEPTH>::new();
+                let mut children_indices_stack = StackVec::<usize, MAX_DEPTH>::new(); // ;
                 ref_stack.push_root(root.as_mut());
 
                 let (mut overflow_k, mut overflow_value) = 'search_and_insert: loop {
@@ -2258,8 +2332,8 @@ impl<K: Ord, V> BTree<K, V> {
                 None
             }
             Child::Node(root) => {
-                let mut ref_stack = OnStackRefMutStack::<_, 20>::new();
-                let mut children_indices_stack = StackVec::<_, 20>::new(); // ;
+                let mut ref_stack = OnStackRefMutStack::<_, MAX_DEPTH>::new();
+                let mut children_indices_stack = StackVec::<_, MAX_DEPTH>::new(); // ;
                 ref_stack.push_root(root.as_mut());
 
                 let (removed_k, removed_value) = 'search_and_remove: loop {
@@ -2461,77 +2535,222 @@ impl<K: Ord, V> BTree<K, V> {
         }
     }
 
-    // pub fn iter(&self) -> BTreeIter<K, V> {
-    //     let mut left = Vec::with_capacity(self.depth());
-    //     left.push((self.root.as_ref(), 0));
-    //     while let Some(&(ChildRef::Node(node), _)) = left.last() {
-    //         left.push((node.children().get(0).unwrap(), 0));
-    //     }
+    pub fn iter(&self) -> BTreeIter<K, V> {
+        let mut left = StackVec::new();
+        left.push((self.root.as_ref(), 0)).assert_none();
+        while let Some(&(ChildRef::Node(node), _)) = left.last() {
+            left.push((node.children().get(0).unwrap(), 0))
+                .assert_none();
+        }
 
-    //     let mut right = Vec::with_capacity(self.depth());
-    //     right.push((self.root.as_ref(), self.root.num_elements()));
-    //     while let Some(&(ChildRef::Node(node), child_idx)) = right.last() {
-    //         let child = node.children().get(child_idx).unwrap();
-    //         right.push((child, child.num_elements()));
-    //     }
+        let mut right = StackVec::new();
+        right
+            .push((self.root.as_ref(), self.root.num_elements()))
+            .assert_none();
+        while let Some(&(ChildRef::Node(node), child_idx)) = right.last() {
+            let child = node.children().get(child_idx).unwrap();
+            right.push((child, child.num_elements())).assert_none();
+        }
 
-    //     BTreeIter {
-    //         left,
-    //         right,
-    //         len: self.len(),
-    //     }
-    // }
+        BTreeIter {
+            left,
+            right,
+            len: self.len(),
+        }
+    }
 
-    // pub fn iter_mut(&mut self) -> BTreeIterMut<K, V> {
-    //     unsafe {
-    //         let mut left = Vec::with_capacity(self.depth());
-    //         left.push((
-    //             match self.root.as_mut() {
-    //                 ChildRefMut::Node(root) => ChildPtrMut::Node(root),
-    //                 ChildRefMut::Leaf(root) => ChildPtrMut::Leaf(root),
-    //             },
-    //             0,
-    //         ));
+    pub fn iter_mut(&mut self) -> BTreeIterMut<K, V> {
+        unsafe {
+            let mut left = StackVec::new();
+            left.push((
+                match self.root.as_mut() {
+                    ChildRefMut::Node(root) => ChildPtrMut::Node(root),
+                    ChildRefMut::Leaf(root) => ChildPtrMut::Leaf(root),
+                },
+                0,
+            ))
+            .assert_none();
 
-    //         while let Some(&(ChildPtrMut::Node(node), _)) = left.last() {
-    //             left.push((
-    //                 match (*node).children_mut() {
-    //                     ChildrenSliceMut::Nodes(children) => ChildPtrMut::Node(&mut *children[0]),
-    //                     ChildrenSliceMut::Leafs(children) => ChildPtrMut::Leaf(&mut *children[0]),
-    //                 },
-    //                 0,
-    //             ));
-    //         }
+            while let Some(&(ChildPtrMut::Node(node), _)) = left.last() {
+                left.push((
+                    match (*node).children_mut() {
+                        ChildrenSliceMut::Nodes(children) => ChildPtrMut::Node(&mut *children[0]),
+                        ChildrenSliceMut::Leafs(children) => ChildPtrMut::Leaf(&mut *children[0]),
+                    },
+                    0,
+                ))
+                .assert_none();
+            }
 
-    //         let mut right = Vec::with_capacity(self.depth());
-    //         right.push((
-    //             match self.root.as_mut() {
-    //                 ChildRefMut::Node(root) => ChildPtrMut::Node(root),
-    //                 ChildRefMut::Leaf(root) => ChildPtrMut::Leaf(root),
-    //             },
-    //             self.root.num_elements(),
-    //         ));
-    //         while let Some(&(ChildPtrMut::Node(node), child_idx)) = right.last() {
-    //             right.push(match (*node).children_mut() {
-    //                 ChildrenSliceMut::Nodes(children) => {
-    //                     let child = &mut *children[child_idx];
-    //                     (ChildPtrMut::Node(child), child.num_elements())
-    //                 }
-    //                 ChildrenSliceMut::Leafs(children) => {
-    //                     let child = &mut *children[child_idx];
-    //                     (ChildPtrMut::Leaf(child), child.len())
-    //                 }
-    //             });
-    //         }
+            let mut right = StackVec::new();
+            right
+                .push((
+                    match self.root.as_mut() {
+                        ChildRefMut::Node(root) => ChildPtrMut::Node(root),
+                        ChildRefMut::Leaf(root) => ChildPtrMut::Leaf(root),
+                    },
+                    self.root.num_elements(),
+                ))
+                .assert_none();
+            while let Some(&(ChildPtrMut::Node(node), child_idx)) = right.last() {
+                right
+                    .push(match (*node).children_mut() {
+                        ChildrenSliceMut::Nodes(children) => {
+                            let child = &mut *children[child_idx];
+                            (ChildPtrMut::Node(child), child.num_elements())
+                        }
+                        ChildrenSliceMut::Leafs(children) => {
+                            let child = &mut *children[child_idx];
+                            (ChildPtrMut::Leaf(child), child.len())
+                        }
+                    })
+                    .assert_none();
+            }
 
-    //         BTreeIterMut {
-    //             left,
-    //             right,
-    //             len: self.len(),
-    //             phantom: PhantomData,
-    //         }
-    //     }
-    // }
+            BTreeIterMut {
+                left,
+                right,
+                len: self.len(),
+                phantom: PhantomData,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BTreeEntry<'a, K: Ord, V> {
+    node_stack: StackVec<&'a Node<K, V>, MAX_DEPTH>,
+    index_stack: StackVec<usize, MAX_DEPTH>,
+    leaf: Option<&'a NodeElements<K, V>>,
+}
+
+impl<'a, K: Ord, V> BTreeEntry<'a, K, V> {
+    pub fn key(&self) -> &'a K {
+        let idx = *self.index_stack.last().unwrap();
+        match self.leaf {
+            Some(leaf) => &leaf.keys()[idx],
+            None => &self.node_stack.last().unwrap().keys()[idx],
+        }
+    }
+
+    pub fn value(&self) -> &'a V {
+        let idx = *self.index_stack.last().unwrap();
+        match self.leaf {
+            Some(leaf) => &leaf.values()[idx],
+            None => &self.node_stack.last().unwrap().values()[idx],
+        }
+    }
+
+    pub fn next(&mut self) -> bool {
+        let idx = self.index_stack.last_mut().unwrap();
+        match self.leaf {
+            Some(leaf) => {
+                if *idx + 1 < leaf.len() {
+                    *idx += 1;
+
+                    true
+                } else {
+                    for ((i, node), idx) in self
+                        .node_stack
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .zip(self.index_stack.iter().copied().rev().skip(1))
+                    {
+                        if idx < node.num_elements() {
+                            self.leaf = None;
+
+                            while i + 1 < self.node_stack.len() {
+                                self.node_stack.pop();
+                            }
+                            while i + 1 < self.index_stack.len() {
+                                self.index_stack.pop();
+                            }
+                            return true;
+                        }
+                    }
+
+                    false
+                }
+            }
+            None => {
+                *idx += 1;
+
+                loop {
+                    let node = *self.node_stack.last().unwrap();
+                    let idx = *self.index_stack.last().unwrap();
+
+                    self.index_stack.push(0).assert_none();
+                    match node.children() {
+                        ChildrenSlice::Nodes(children) => {
+                            let child = children[idx].as_ref();
+                            self.node_stack.push(child).assert_none();
+                        }
+                        ChildrenSlice::Leafs(children) => {
+                            self.leaf = Some(children[idx].as_ref());
+                            break;
+                        }
+                    }
+                }
+
+                true
+            }
+        }
+    }
+
+    pub fn prev(&mut self) -> bool {
+        match &mut self.leaf {
+            Some(_) => {
+                let idx = self.index_stack.last_mut().unwrap();
+                if 0 < *idx {
+                    *idx -= 1;
+
+                    true
+                } else {
+                    for (i, idx) in self.index_stack.iter_mut().enumerate().rev().skip(1) {
+                        if 0 < *idx {
+                            *idx -= 1;
+                            self.leaf = None;
+
+                            while i + 1 < self.node_stack.len() {
+                                self.node_stack.pop();
+                            }
+                            while i + 1 < self.index_stack.len() {
+                                self.index_stack.pop();
+                            }
+                            return true;
+                        }
+                    }
+
+                    false
+                }
+            }
+            None => {
+                loop {
+                    let node = *self.node_stack.last().unwrap();
+                    let idx = *self.index_stack.last().unwrap();
+
+                    match node.children() {
+                        ChildrenSlice::Nodes(children) => {
+                            let child = children[idx].as_ref();
+                            self.node_stack.push(child).assert_none();
+                            self.index_stack
+                                .push(child.num_children() - 1)
+                                .assert_none();
+                        }
+                        ChildrenSlice::Leafs(children) => {
+                            let child = children[idx].as_ref();
+                            self.leaf = Some(child);
+                            self.index_stack.push(child.len() - 1).assert_none();
+                            break;
+                        }
+                    }
+                }
+
+                true
+            }
+        }
+    }
 }
 
 // impl<K: Ord, V> Default for BTree<K, V> {
@@ -2540,207 +2759,213 @@ impl<K: Ord, V> BTree<K, V> {
 //     }
 // }
 
-// #[derive(Clone, Debug)]
-// pub struct BTreeIter<'a, K: Ord, V> {
-//     left: Vec<(ChildRef<'a, K, V>, usize)>,
-//     right: Vec<(ChildRef<'a, K, V>, usize)>,
-//     len: usize,
-// }
-//
-// impl<'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
-//     type Item = (&'a K, &'a V);
-//
-//     fn next(&mut self) -> Option<Self::Item> {
-//         if 0 < self.len {
-//             self.len -= 1;
-//             let (child, elem_idx) = self.left.last_mut().unwrap();
-//             let item = (&child.keys()[*elem_idx], &child.values()[*elem_idx]);
-//
-//             *elem_idx += 1;
-//             match *child {
-//                 ChildRef::Node(_) => {
-//                     while let Some(&(ChildRef::Node(node), child_idx)) = self.left.last() {
-//                         self.left.push((node.children().get(child_idx).unwrap(), 0));
-//                     }
-//                 }
-//                 ChildRef::Leaf(_) => {
-//                     while let Some(&(child, elem_idx)) = self.left.last() {
-//                         if child.num_elements() <= elem_idx {
-//                             self.left.pop();
-//                         }
-//                     }
-//                 }
-//             }
-//
-//             Some(item)
-//         } else {
-//             None
-//         }
-//     }
-//
-//     fn size_hint(&self) -> (usize, Option<usize>) {
-//         (self.len, Some(self.len))
-//     }
-//
-//     fn count(self) -> usize {
-//         self.len
-//     }
-// }
-//
-// impl<'a, K: Ord, V> DoubleEndedIterator for BTreeIter<'a, K, V> {
-//     fn next_back(&mut self) -> Option<Self::Item> {
-//         if 0 < self.len {
-//             self.len -= 1;
-//             let (child, elem_idx) = self.right.last_mut().unwrap();
-//             *elem_idx -= 1;
-//             let item = (&child.keys()[*elem_idx], &child.values()[*elem_idx]);
-//
-//             match *child {
-//                 ChildRef::Node(_) => {
-//                     while let Some(&(ChildRef::Node(node), child_idx)) = self.right.last() {
-//                         let child = node.children().get(child_idx).unwrap();
-//                         self.right.push((child, child.num_elements()));
-//                     }
-//                 }
-//                 ChildRef::Leaf(_) => {
-//                     while let Some(&(_, elem_idx)) = self.right.last() {
-//                         if elem_idx == 0 {
-//                             self.right.pop();
-//                         }
-//                     }
-//                 }
-//             }
-//
-//             Some(item)
-//         } else {
-//             None
-//         }
-//     }
-// }
-//
-// impl<'a, K: Ord, V> ExactSizeIterator for BTreeIter<'a, K, V> {
-//     fn len(&self) -> usize {
-//         self.len
-//     }
-// }
-//
-// #[derive(Debug)]
-// pub struct BTreeIterMut<'a, K: Ord, V> {
-//     left: Vec<(ChildPtrMut<K, V>, usize)>,
-//     right: Vec<(ChildPtrMut<K, V>, usize)>,
-//     len: usize,
-//     phantom: PhantomData<ChildRefMut<'a, K, V>>,
-// }
-//
-// impl<'a, K: Ord, V> Iterator for BTreeIterMut<'a, K, V> {
-//     type Item = (&'a K, &'a mut V);
-//
-//     fn next(&mut self) -> Option<Self::Item> {
-//         if 0 < self.len {
-//             self.len -= 1;
-//             let (child, elem_idx) = self.left.last_mut().unwrap();
-//
-//             *elem_idx += 1;
-//             match *child {
-//                 ChildPtrMut::Node(node) => unsafe {
-//                     let node = &mut *node;
-//                     let (keys, values, _) = node.get_all_mut();
-//                     let item = (&keys[*elem_idx], &mut values[*elem_idx]);
-//
-//                     while let Some(&(ChildPtrMut::Node(node), child_idx)) = self.left.last() {
-//                         self.left.push((
-//                             match (*node).children_mut() {
-//                                 ChildrenSliceMut::Nodes(children) => {
-//                                     ChildPtrMut::Node(&mut *children[child_idx])
-//                                 }
-//                                 ChildrenSliceMut::Leafs(children) => {
-//                                     ChildPtrMut::Leaf(&mut *children[child_idx])
-//                                 }
-//                             },
-//                             0,
-//                         ));
-//                     }
-//                     Some(item)
-//                 },
-//                 ChildPtrMut::Leaf(leaf) => unsafe {
-//                     let leaf = &mut *leaf;
-//                     let (keys, values) = leaf.get_all_mut();
-//                     let item = (&keys[*elem_idx], &mut values[*elem_idx]);
-//
-//                     while let Some(&(ref child, elem_idx)) = self.left.last() {
-//                         if match child {
-//                             ChildPtrMut::Leaf(leaf) => (**leaf).len(),
-//                             ChildPtrMut::Node(node) => (**node).num_elements(),
-//                         } <= elem_idx
-//                         {
-//                             self.left.pop();
-//                         }
-//                     }
-//                     Some(item)
-//                 },
-//             }
-//         } else {
-//             None
-//         }
-//     }
-//
-//     fn size_hint(&self) -> (usize, Option<usize>) {
-//         (self.len, Some(self.len))
-//     }
-//
-//     fn count(self) -> usize {
-//         self.len
-//     }
-// }
-//
-// impl<'a, K: Ord, V> DoubleEndedIterator for BTreeIterMut<'a, K, V> {
-//     fn next_back(&mut self) -> Option<Self::Item> {
-//         if 0 < self.len {
-//             self.len -= 1;
-//             let (child, elem_idx) = self.right.last_mut().unwrap();
-//             *elem_idx -= 1;
-//
-//             match *child {
-//                 ChildPtrMut::Node(node) => unsafe {
-//                     let node = &mut *node;
-//                     let (keys, values, _) = node.get_all_mut();
-//                     let item = (&keys[*elem_idx], &mut values[*elem_idx]);
-//
-//                     while let Some(&(ChildPtrMut::Node(node), child_idx)) = self.right.last() {
-//                         self.right.push(match (*node).children_mut() {
-//                             ChildrenSliceMut::Nodes(children) => {
-//                                 let child = &mut *children[child_idx];
-//                                 (ChildPtrMut::Node(child), child.num_elements())
-//                             }
-//                             ChildrenSliceMut::Leafs(children) => {
-//                                 let child = &mut *children[child_idx];
-//                                 (ChildPtrMut::Leaf(child), child.len())
-//                             }
-//                         });
-//                     }
-//                     Some(item)
-//                 },
-//                 ChildPtrMut::Leaf(leaf) => unsafe {
-//                     let leaf = &mut *leaf;
-//                     let (keys, values) = leaf.get_all_mut();
-//                     let item = (&keys[*elem_idx], &mut values[*elem_idx]);
-//
-//                     while let Some(&(_, elem_idx)) = self.right.last() {
-//                         if elem_idx == 0 {
-//                             self.right.pop();
-//                         }
-//                     }
-//                     Some(item)
-//                 },
-//             }
-//         } else {
-//             None
-//         }
-//     }
-// }
-//
-// impl<'a, K: Ord, V> ExactSizeIterator for BTreeIterMut<'a, K, V> {
-//     fn len(&self) -> usize {
-//         self.len
-//     }
-// }
+#[derive(Clone, Debug)]
+pub struct BTreeIter<'a, K: Ord, V> {
+    left: StackVec<(ChildRef<'a, K, V>, usize), MAX_DEPTH>,
+    right: StackVec<(ChildRef<'a, K, V>, usize), MAX_DEPTH>,
+    len: usize,
+}
+
+impl<'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if 0 < self.len {
+            self.len -= 1;
+            let (child, elem_idx) = self.left.last_mut().unwrap();
+            let item = (&child.keys()[*elem_idx], &child.values()[*elem_idx]);
+
+            *elem_idx += 1;
+            match *child {
+                ChildRef::Node(_) => {
+                    while let Some(&(ChildRef::Node(node), child_idx)) = self.left.last() {
+                        self.left
+                            .push((node.children().get(child_idx).unwrap(), 0))
+                            .assert_none();
+                    }
+                }
+                ChildRef::Leaf(_) => {
+                    while let Some(&(child, elem_idx)) = self.left.last() {
+                        if child.num_elements() <= elem_idx {
+                            self.left.pop();
+                        }
+                    }
+                }
+            }
+
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+
+    fn count(self) -> usize {
+        self.len
+    }
+}
+
+impl<'a, K: Ord, V> DoubleEndedIterator for BTreeIter<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if 0 < self.len {
+            self.len -= 1;
+            let (child, elem_idx) = self.right.last_mut().unwrap();
+            *elem_idx -= 1;
+            let item = (&child.keys()[*elem_idx], &child.values()[*elem_idx]);
+
+            match *child {
+                ChildRef::Node(_) => {
+                    while let Some(&(ChildRef::Node(node), child_idx)) = self.right.last() {
+                        let child = node.children().get(child_idx).unwrap();
+                        self.right.push((child, child.num_elements())).assert_none();
+                    }
+                }
+                ChildRef::Leaf(_) => {
+                    while let Some(&(_, elem_idx)) = self.right.last() {
+                        if elem_idx == 0 {
+                            self.right.pop();
+                        }
+                    }
+                }
+            }
+
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, K: Ord, V> ExactSizeIterator for BTreeIter<'a, K, V> {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[derive(Debug)]
+pub struct BTreeIterMut<'a, K: Ord, V> {
+    left: StackVec<(ChildPtrMut<K, V>, usize), MAX_DEPTH>,
+    right: StackVec<(ChildPtrMut<K, V>, usize), MAX_DEPTH>,
+    len: usize,
+    phantom: PhantomData<ChildRefMut<'a, K, V>>,
+}
+
+impl<'a, K: Ord, V> Iterator for BTreeIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if 0 < self.len {
+            self.len -= 1;
+            let (child, elem_idx) = self.left.last_mut().unwrap();
+
+            *elem_idx += 1;
+            match *child {
+                ChildPtrMut::Node(node) => unsafe {
+                    let node = &mut *node;
+                    let (keys, values, _) = node.get_all_mut();
+                    let item = (&keys[*elem_idx], &mut values[*elem_idx]);
+
+                    while let Some(&(ChildPtrMut::Node(node), child_idx)) = self.left.last() {
+                        self.left
+                            .push((
+                                match (*node).children_mut() {
+                                    ChildrenSliceMut::Nodes(children) => {
+                                        ChildPtrMut::Node(&mut *children[child_idx])
+                                    }
+                                    ChildrenSliceMut::Leafs(children) => {
+                                        ChildPtrMut::Leaf(&mut *children[child_idx])
+                                    }
+                                },
+                                0,
+                            ))
+                            .assert_none();
+                    }
+                    Some(item)
+                },
+                ChildPtrMut::Leaf(leaf) => unsafe {
+                    let leaf = &mut *leaf;
+                    let (keys, values) = leaf.get_all_mut();
+                    let item = (&keys[*elem_idx], &mut values[*elem_idx]);
+
+                    while let Some(&(ref child, elem_idx)) = self.left.last() {
+                        if match child {
+                            ChildPtrMut::Leaf(leaf) => (**leaf).len(),
+                            ChildPtrMut::Node(node) => (**node).num_elements(),
+                        } <= elem_idx
+                        {
+                            self.left.pop();
+                        }
+                    }
+                    Some(item)
+                },
+            }
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+
+    fn count(self) -> usize {
+        self.len
+    }
+}
+
+impl<'a, K: Ord, V> DoubleEndedIterator for BTreeIterMut<'a, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if 0 < self.len {
+            self.len -= 1;
+            let (child, elem_idx) = self.right.last_mut().unwrap();
+            *elem_idx -= 1;
+
+            match *child {
+                ChildPtrMut::Node(node) => unsafe {
+                    let node = &mut *node;
+                    let (keys, values, _) = node.get_all_mut();
+                    let item = (&keys[*elem_idx], &mut values[*elem_idx]);
+
+                    while let Some(&(ChildPtrMut::Node(node), child_idx)) = self.right.last() {
+                        self.right
+                            .push(match (*node).children_mut() {
+                                ChildrenSliceMut::Nodes(children) => {
+                                    let child = &mut *children[child_idx];
+                                    (ChildPtrMut::Node(child), child.num_elements())
+                                }
+                                ChildrenSliceMut::Leafs(children) => {
+                                    let child = &mut *children[child_idx];
+                                    (ChildPtrMut::Leaf(child), child.len())
+                                }
+                            })
+                            .assert_none();
+                    }
+                    Some(item)
+                },
+                ChildPtrMut::Leaf(leaf) => unsafe {
+                    let leaf = &mut *leaf;
+                    let (keys, values) = leaf.get_all_mut();
+                    let item = (&keys[*elem_idx], &mut values[*elem_idx]);
+
+                    while let Some(&(_, elem_idx)) = self.right.last() {
+                        if elem_idx == 0 {
+                            self.right.pop();
+                        }
+                    }
+                    Some(item)
+                },
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, K: Ord, V> ExactSizeIterator for BTreeIterMut<'a, K, V> {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
