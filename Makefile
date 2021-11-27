@@ -22,6 +22,7 @@ run: $(iso)
 	@mkdir -p $$(date +"./logs/%Y-%m-%d/")
 	@ln -sf "$$(date +"$$(pwd)/logs/%Y-%m-%d/%H-%M-%S-%Z.log")" ./logs/last.log
 	@qemu-system-x86_64 \
+		-s -S \
 		-m 8G \
 		-cdrom $(iso) \
 		-serial "file:$$(date +"logs/%Y-%m-%d/%H-%M-%S-%Z.log")"
@@ -55,4 +56,4 @@ kernel:
 # compile assembly files
 $(build_folder)/arch/$(arch)/%.o: src/arch/$(arch)/%.asm
 	@mkdir -p $(shell dirname $@)
-	@nasm -felf64 $< -o $@
+	@nasm -felf64 -g $< -o $@

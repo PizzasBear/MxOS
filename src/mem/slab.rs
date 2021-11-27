@@ -82,7 +82,7 @@ impl<T: Sized> SlabAllocator<T> {
                 self.free_list =
                     ptr::NonNull::new((self.free_list.as_ptr() as usize + Self::SLAB_SIZE) as _)
                         .unwrap();
-                self.free_list.as_mut().size -= Self::SLAB_SIZE;
+                *self.free_list.as_mut() = SlabFreeList { size, next };
                 self.free_size -= Self::SLAB_SIZE;
 
                 Some(ptr)
@@ -196,6 +196,9 @@ impl<T> SlabBox<T> {
     }
 }
 
+unsafe impl<T: Send> Send for SlabAllocator<T> {}
+unsafe impl<T: Sync> Sync for SlabAllocator<T> {}
+
 impl<T> AsRef<T> for SlabBox<T> {
     #[inline]
     fn as_ref(&self) -> &T {
@@ -246,6 +249,9 @@ impl<T: fmt::Debug> fmt::Debug for SlabBox<T> {
         self.as_ref().fmt(f)
     }
 }
+
+unsafe impl<T: Send> Send for SlabBox<T> {}
+unsafe impl<T: Sync> Sync for SlabBox<T> {}
 
 // pub struct LockedSlabAllocator<T>(spin::Mutex<SlabAllocator<T>>);
 //

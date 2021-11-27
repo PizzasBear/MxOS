@@ -6,18 +6,18 @@ use x86_64::PhysAddr;
 /// A very simple frame allocator, it can't deallocate any frames.
 /// It will be used for setup of the main frame allocator.
 #[derive(Debug)]
-pub struct BumpAllocator<'a> {
+pub struct BumpAllocator<'a, const N: usize> {
     current_frame: usize,
-    taken_areas: [Range<usize>; 2],
+    taken_areas: [Range<usize>; N],
     current_area: Option<&'a MemoryArea>,
     memory_area_index: usize,
     memory_map_tag: &'a MemoryMapTag,
 }
 
-impl<'a> BumpAllocator<'a> {
+impl<'a, const N: usize> BumpAllocator<'a, N> {
     /// Create a new BasicFrameAllocator. Taken areas are addresses that are taken by either the
     /// kernel or the Multiboot2 information structure.
-    pub fn new(taken_areas: [Range<usize>; 2], memory_map_tag: &'a MemoryMapTag) -> Self {
+    pub fn new(taken_areas: [Range<usize>; N], memory_map_tag: &'a MemoryMapTag) -> Self {
         Self {
             current_frame: 0x200000,
             current_area: memory_map_tag.memory_areas().next(),
@@ -28,7 +28,7 @@ impl<'a> BumpAllocator<'a> {
     }
 }
 
-unsafe impl<'a> FrameAllocator<Size2MiB> for BumpAllocator<'a> {
+unsafe impl<'a, const N: usize> FrameAllocator<Size2MiB> for BumpAllocator<'a, N> {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
         let current_area = self.current_area?;
 

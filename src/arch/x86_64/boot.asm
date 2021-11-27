@@ -1,14 +1,16 @@
 extern long_mode_start
+
 global start
+global special_pd_table
 
 section .text
 bits 32
 start:
     mov esp, stack_top
-    call check_multiboot
+    push dword 0
+    push ebx
 
-    ; Save multiboot info pointer
-    mov edi, ebx
+    call check_multiboot
 
     call check_cpuid
     call check_long_mode
@@ -84,14 +86,23 @@ check_long_mode:
     jmp error
 
 set_up_page_tables:
-    mov eax, pdp_table
-    or eax, 0b11
+    mov eax, pdp0_table
+    or eax, 3
     mov [pml4_table], eax
 
-    mov dword [pdp_table], 0x83
-    mov dword [pdp_table+8], 0x40000083
-    mov dword [pdp_table+16], 0x80000083
-    mov dword [pdp_table+24], 0xC0000083
+    mov eax, pdp511_table
+    or eax, 3
+    mov [pml4_table + (511*8)], eax
+
+    mov dword [pdp0_table], 0x83
+    mov dword [pdp0_table+8], 0x40000083
+    mov dword [pdp0_table+16], 0x80000083
+    mov dword [pdp0_table+24], 0xC0000083
+
+    ; special page table
+    mov eax, special_pd_table
+    or eax, 3
+    mov [pdp511_table + (510*8)], eax
 
     ret
 ;     mov eax, pdp_table
@@ -142,12 +153,14 @@ section .bss
 align 4096
 pml4_table: ; Page-Map Level-4 Table
     resb 4096
-pdp_table: ; Page-Directory Pointer Table
+pdp0_table: ; Page-Directory Pointer Table
     resb 4096
-; pd_table: ; Page-Directory Table
-;     resb 4096
+pdp511_table: ; Page-Directory Pointer Table
+    resb 4096
+special_pd_table: ; Page-Directory Table
+    resb 4096
 stack_bottom:
-    resb 16 * 1024
+    resb 4*4096
 stack_top:
 
 section .rodata

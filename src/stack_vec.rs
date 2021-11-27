@@ -1,3 +1,9 @@
+//! All stuff that is related to `StackVec`.
+//!
+
+// TODO: Document the entire file.
+#![allow(missing_docs)]
+
 use core::{
     fmt,
     mem::{self, ManuallyDrop, MaybeUninit},
@@ -58,6 +64,7 @@ pub struct OuterLenStackVec<T, const N: usize> {
     _data: [MaybeUninit<T>; N],
 }
 
+/// `OuterLenStackVec` version of `StackVecDrain`.
 pub struct OuterLenStackVecDrain<'a, T, const N: usize> {
     tail_start: usize,
     tail_len: usize,
@@ -67,6 +74,7 @@ pub struct OuterLenStackVecDrain<'a, T, const N: usize> {
 }
 
 impl<T, const N: usize> OuterLenStackVec<T, N> {
+    /// Creates a new empty, zero length, `OuterLenStackVec`.
     pub fn new() -> Self {
         Self {
             _data: MaybeUninitExt::uninit_array(),
@@ -308,17 +316,25 @@ impl<'a, T, const N: usize> Drop for OuterLenStackVecDrain<'a, T, N> {
     }
 }
 
+/// A dynamicaly sized array with a limited capacity `N` stored on the stack.
+/// The interface of `StackVec` is designed to be similar to `Vec`.
 #[repr(C)]
 pub struct StackVec<T, const N: usize> {
     _data: OuterLenStackVec<T, N>,
     _len: usize,
 }
 
+/// `StackVec` into iterator.
 pub struct StackVecIntoIter<T, const N: usize> {
     _data: StackVec<T, N>,
     _start: usize,
 }
 
+/// The result of `StackVec::drain`. It implements iterator, to iterate over the drained items.
+/// It also features a `self.as_slice()` which returns the drained items (which haven't yet been
+/// iterated over) as a slice.
+///
+/// Design to work similarly to `std::vec::Drain`.
 pub struct StackVecDrain<'a, T, const N: usize> {
     tail_start: usize,
     tail_len: usize,
@@ -327,6 +343,7 @@ pub struct StackVecDrain<'a, T, const N: usize> {
 }
 
 impl<T, const N: usize> StackVec<T, N> {
+    /// Creates a new empty `StackVec`.
     pub fn new() -> Self {
         unsafe { Self::from_raw_parts(OuterLenStackVec::new(), 0) }
     }
@@ -341,41 +358,67 @@ impl<T, const N: usize> StackVec<T, N> {
         &mut self._data._data
     }
 
+    /// Returns a raw pointer to the vector's buffer.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         self._data.as_ptr()
     }
 
+    /// Returns an unsafe mutable pointer to the vector's buffer.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self._data.as_mut_ptr()
     }
 
+    /// Returns the number of elements in the vector, also referred to as its 'length'.
     #[inline(always)]
     pub const fn len(&self) -> usize {
         self._len
     }
 
+    /// Returns the maximum number of elements in the vector, also referred to as its 'capacity'.
+    /// This function just returns the generic constant `N`.
     #[inline(always)]
     pub const fn capacity(&self) -> usize {
         N
     }
 
+    /// Returns true if the vector cannot contain any more elements (self.len() == self.capacity()).
     #[inline(always)]
     pub const fn is_full(&self) -> bool {
         self.len() == N
     }
 
+    /// Forces the length of the vector to `new_len`.
+    ///
+    /// This is a low-level operation that maintains none of the normal invariants of the type.
+    ///
+    /// # Safety
+    /// `new_len` must be less than or equal to `capacity()`.
+    /// The elements at `old_len..new_len` must be initialized.
     #[inline(always)]
-    pub unsafe fn set_len(&mut self, len: usize) {
-        self._len = len;
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        self._len = new_len;
     }
 
+    /// Returns a mutable reference to the internal `self.len`.
+    /// Use `set_len()` instead if possible.
+    ///
+    /// This is a low-level operation that maintains none of the normal invariants of the type.
+    ///
+    /// # Safety
+    /// `new_len` must be less than or equal to `capacity()`.
+    /// The elements at `old_len..new_len` must be initialized.
     #[inline(always)]
     pub unsafe fn get_len_mut(&mut self) -> &mut usize {
         &mut self._len
     }
 
+    /// Decomposes a `StackVec<T>` into its raw components.
+    ///
+    /// Returns the `OuterLenStackVec<T>` and the length of the vector (in elements).
+    /// These are the same arguments in the same order as `from_raw_parts`.
+    #[inline]
     pub fn into_raw_parts(self) -> (OuterLenStackVec<T, N>, usize) {
         unsafe {
             let mb = ManuallyDrop::new(self);
@@ -383,6 +426,7 @@ impl<T, const N: usize> StackVec<T, N> {
         }
     }
 
+    /// Creates a `StackVec` directly from its raw components.
     #[inline(always)]
     pub const unsafe fn from_raw_parts(data: OuterLenStackVec<T, N>, len: usize) -> Self {
         Self {
@@ -391,27 +435,34 @@ impl<T, const N: usize> StackVec<T, N> {
         }
     }
 
-    /// Inserts `item` at `idx` such that `self[idx] == item`, the function returns the overflow.
+    /// Inserts `item` at `idx` such that `self[idx] == item`, elements are shifted to the right to
+    /// make space. The function returns the rightmost element in case of an overflow.
+    ///
+    /// Because this shifts over the remaining elements, it has a worst-case performance of O(n).
     #[must_use]
     pub fn insert(&mut self, idx: usize, item: T) -> Option<T> {
         unsafe { self._data.insert(&mut self._len, idx, item) }
     }
 
-    /// Pushes `item` to the end, returns the overflow (the overflow will always be item).
+    /// Appends an element to the back of the vector, returns the item in case of an overflow.
     #[must_use]
     pub fn push(&mut self, item: T) -> Option<T> {
         unsafe { self._data.push(&mut self._len, item) }
     }
 
-    /// Pops the last element.
+    /// Removes the last element from the vector and returns it, or None if it is empty.
     pub fn pop(&mut self) -> Option<T> {
         unsafe { self._data.pop(&mut self._len) }
     }
 
+    // /// Splits the vector, such that `self` will contain the left pa
     pub fn split_at(&mut self, left_len: usize) -> Self {
         unsafe { self._data.split_at(&mut self._len, left_len) }
     }
 
+    /// Removes and returns the element at position index within the vector, shifting all elements after it to the left.
+    ///
+    /// Because this shifts over the remaining elements, it has a worst-case performance of O(n).
     pub fn remove(&mut self, idx: usize) -> T {
         unsafe { self._data.remove(&mut self._len, idx) }
     }

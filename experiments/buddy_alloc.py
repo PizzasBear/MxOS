@@ -1,7 +1,7 @@
 from typing import Reversible, Union
 
-ORDER: int = 9
-MEMORY_SIZE: int = 2 << ORDER - 1
+ORDER: int = 5
+MEMORY_SIZE: int = 4 << ORDER - 1
 
 
 class LinkedListNode:
@@ -141,6 +141,43 @@ def order_free(addr: int, order: int, clear: bool = True):
         order_buddies[oaddr] = False
         free_areas[order].push(addr)
 
+def order_mark_as_used(oaddr: int, order: int):
+    global buddies, free_areas
+
+    while order < ORDER:
+        if order < ORDER - 1 and buddies[order][oaddr]:
+            if buddies[order][oaddr ^ 1]:
+                buddies[order][oaddr ^ 1] = False
+                free_areas[order].push((oaddr ^ 1) << order)
+            order += 1
+            oaddr >>= 1
+        else:
+            buddies[order][oaddr] = True
+            break
+
+def mark_as_used(start_address: int, end_address: int):
+    global buddies, free_areas
+
+    order = 0
+
+    while order < ORDER - 1 and start_address < end_address:
+        print(f"{order}: {start_address}..{end_address}")
+        if start_address & 1:
+            order_mark_as_used(start_address, order)
+        if end_address & 1:
+            order_mark_as_used(end_address - 1, order)
+        print_buddies()
+
+        start_address = (start_address + 1) // 2
+        end_address = end_address // 2
+
+        order += 1
+
+    if order == ORDER - 1:
+        print(f"{order}: {start_address}..{end_address}")
+        for i in range(start_address, end_address):
+            buddies[ORDER - 1][i] = True
+
 # def free(addr: int, size: int, clear: bool = True):
 #     global buddies, free_areas
 # 
@@ -155,30 +192,48 @@ def order_free(addr: int, order: int, clear: bool = True):
 #         i += 1
 
 
-print("malloc:")
-print_buddies()
-a0 = order_malloc(3)
-print_buddies()
-a1 = order_malloc(2)
-print_buddies()
-a2 = order_malloc(1)
-print_buddies()
-a3 = order_malloc(1)
+# print("malloc:")
+# print_buddies()
+# a0 = order_malloc(3)
+# print_buddies()
+# a1 = order_malloc(2)
+# print_buddies()
+# a2 = order_malloc(1)
+# print_buddies()
+# a3 = order_malloc(1)
+# print_buddies()
+# 
+# print()
+# print("free:")
+# order_free(a0, 3)
+# print_buddies()
+# order_free(a1, 2)
+# print_buddies()
+# order_free(a2, 1)
+# print_buddies()
+# order_free(a3, 1)
+# print_buddies()
+# 
+# print()
+# print("malloc:")
+# a0 = order_malloc(3)
+# print_buddies()
+
+# order_malloc(3)
+# order_malloc(1)
+# a0 = order_malloc(1)
+# a1 = order_malloc(1)
+# a2 = order_malloc(0)
+# order_malloc(0)
+# 
+# order_free(a0, 1)
+# order_free(a1, 1)
+# order_free(a2, 0)
 print_buddies()
 
 print()
-print("free:")
-order_free(a0, 3)
-print_buddies()
-order_free(a1, 2)
-print_buddies()
-order_free(a2, 1)
-print_buddies()
-order_free(a3, 1)
-print_buddies()
-
-print()
-print("malloc")
-a0 = order_malloc(1)
+print("mark as used:")
+mark_as_used(11, 60)
+# mark_as_used(10, 15)
 print_buddies()
 

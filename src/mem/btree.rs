@@ -53,7 +53,7 @@ impl<T: Clone> BoundClonedExt for ops::Bound<&T> {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 struct NodeElements<K: Ord, V> {
     _keys: OuterLenStackVec<K, MAX_NUM_ELEMENTS>,
     _values: OuterLenStackVec<V, MAX_NUM_ELEMENTS>,
@@ -1363,7 +1363,7 @@ impl<K: Ord, V> ExactSizeIterator for ChildrenIntoIter<K, V> {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 struct Node<K: Ord, V> {
     _elements: NodeElements<K, V>,
     _children: OuterLenChildren<K, V>,

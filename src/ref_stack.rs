@@ -1,6 +1,9 @@
+//! This module contains the OnStackRefMutStack.
+//!
+
 use crate::stack_vec::StackVec;
 use core::marker::PhantomData;
-use core::mem;
+// use core::mem;
 
 // pub struct RefMutStack<'a, T>(Vec<*mut T>, PhantomData<&'a mut T>);
 //
@@ -116,14 +119,19 @@ use core::mem;
 //     }
 // }
 
+/// This data structure based on `StackVec` allows mutable borrowing in a way that's simular to
+/// recursion. This data structure is usefull for going over a linked list, and going back, without
+/// recursion.
 pub struct OnStackRefMutStack<'a, T, const N: usize>(StackVec<*mut T, N>, PhantomData<&'a mut T>);
 
 impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
+    /// Creates an empty `OnStackRefMutStack`.
     #[inline]
     pub fn new() -> Self {
         Self(StackVec::new(), PhantomData)
     }
 
+    /// Creates a new `OnStackRefMutStack` that contains `root`.
     #[inline]
     pub fn with_root(root: &'a mut T) -> Self {
         let mut vec = StackVec::<*mut T, N>::new();
@@ -131,40 +139,46 @@ impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
         Self(vec, PhantomData)
     }
 
+    /// Returns true if `self` is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Returns the number of elements in `self`.
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns the maximum number of elements that `self` can be contained.
+    /// This is the constant `N` that `OnStackRefMutStack<'a, T, const N: usize>` is initialized with.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.0.capacity()
     }
 
-    pub fn push_root(&mut self, root: &'a mut T) -> Self {
-        if self.0.is_empty() {
-            assert!(self.0.push(root).is_none());
-            Self::new()
-        } else {
-            mem::replace(self, Self::with_root(root))
-        }
+    /// Pushes the root, this can only be done if `self` is empty.
+    #[inline]
+    pub fn push_root(&mut self, root: &'a mut T) {
+        assert!(self.0.is_empty());
+        assert!(self.0.push(root).is_none());
     }
 
+    /// Returns a reference to the last inserted element.
     #[inline]
     pub fn peek(&self) -> Option<&T> {
         unsafe { Some(&**self.0.last()?) }
     }
 
+    /// Returns a mutable reference to the last inserted element.
     #[inline]
     pub fn peek_mut(&mut self) -> Option<&mut T> {
         unsafe { Some(&mut **self.0.last_mut()?) }
     }
 
+    /// Pushes a new node by calling `f` on the last inserted node and pushing its result.
+    /// Returns `true` if the push is successful (if `self` isn't full or empty), otherwise returns `false`.
     #[inline]
     pub fn push<F: FnOnce(&'a mut T) -> &'a mut T>(&mut self, f: F) -> bool {
         if self.0.is_full() {
@@ -196,7 +210,9 @@ impl<'a, T, const N: usize> OnStackRefMutStack<'a, T, N> {
     //     }
     // }
 
-    /// `self.pop()` returns `Some` only if the root was popped, otherwise it returns `None`
+    /// Pops the last inserted reference off `self`.
+    /// If the root is popped, the function will returns it, otherwise `self.pop()` will return
+    /// None.
     #[inline]
     pub fn pop(self: &mut Self) -> Option<&'a mut T> {
         let popped = self.0.pop();
