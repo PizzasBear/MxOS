@@ -2641,6 +2641,7 @@ impl<'a, K: Ord, V> BTreeEntry<'a, K, V> {
         }
     }
 
+    /// Returns `true` if successfully moved to the next entry, `false` otherwise (you're on the last entry).
     pub fn next(&mut self) -> bool {
         let idx = self.index_stack.last_mut().unwrap();
         match self.leaf {
@@ -2698,6 +2699,7 @@ impl<'a, K: Ord, V> BTreeEntry<'a, K, V> {
         }
     }
 
+    /// Returns `true` if successfully moved to the previous entry, `false` otherwise (you're on the first entry).
     pub fn prev(&mut self) -> bool {
         match &mut self.leaf {
             Some(_) => {

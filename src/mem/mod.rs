@@ -4,6 +4,7 @@
 mod btree;
 mod bump;
 mod slab;
+mod vma;
 
 pub use slab::{SlabAllocator, SlabBox};
 
@@ -173,6 +174,18 @@ impl<const N: usize> BuddyAllocator<N> {
 }
 
 const GLOBAL_BUDDY_DEPTH: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, PartialOrd, Ord)]
+struct MemSegment {
+    pub ptr: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, PartialOrd, Ord)]
+struct MemSegmentOrdBySize {
+    pub size: usize,
+    pub ptr: usize,
+}
 
 /// The global allocator struct
 pub struct GlobalChunkAllocator {
